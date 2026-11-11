@@ -62,7 +62,7 @@ const STATUS = { ok: 'Sağlıklı', warn: 'Uyarı', crit: 'Kritik', down: 'Çevr
 const PORTS = { 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS', 80: 'HTTP', 110: 'POP3', 135: 'RPC', 139: 'NetBIOS', 143: 'IMAP',
   443: 'HTTPS', 445: 'SMB', 587: 'SMTP', 993: 'IMAPS', 1433: 'MSSQL', 1521: 'Oracle', 3306: 'MySQL', 3389: 'RDP', 5432: 'PostgreSQL',
   5900: 'VNC', 6379: 'Redis', 8080: 'HTTP', 8443: 'HTTPS', 27017: 'MongoDB' };
-const portName = (p) => (PORTS[p] ? `${p} · ${PORTS[p]}` : String(p));
+const portName = (p) => (!p ? 'Windows oturumu' : PORTS[p] ? `${p} · ${PORTS[p]}` : String(p));
 const badge = (cls, text) => h`<span class="badge b-${cls}">${text}</span>`;
 const level = (v, warn = 70, crit = 85) => (v >= crit ? 'crit' : v >= warn ? 'warn' : '');
 function meter(v) {
@@ -191,7 +191,7 @@ const views = {
     const disks = x.disks.map((v) => h`<div><div class="wrap between"><span class="mono">${v.mount}</span><span class="mono ${level(v.pct) ? 't-' + level(v.pct) : ''}">%${Math.round(v.pct)}</span></div>
       <div class="bar wide"><i class="${level(v.pct)}" style="width:${v.pct}%"></i></div><div class="small muted">${fmtBytes(v.total - v.used)} boş · toplam ${fmtBytes(v.total)}</div></div>`);
     const pts = (key) => d.series.map((p) => ({ t: p.t, v: p[key] || 0 }));
-    const capture = { sniffer: 'Tüm bağlantı denemeleri yakalanıyor', poll: 'Yalnızca kabul edilen bağlantılar izleniyor (ajan yetkisi kısıtlı)', off: 'Bağlantı yakalama kapalı' }[x.capture_mode] || '—';
+    const capture = { sniffer: 'Tüm bağlantı denemeleri yakalanıyor', audit: 'Tüm bağlantı denemeleri güvenlik duvarı denetim kayıtlarından izleniyor', poll: 'Yalnızca kabul edilen bağlantılar izleniyor (ajan yetkisi kısıtlı)', off: 'Bağlantı yakalama kapalı' }[x.capture_mode] || '—';
     return h`<header class="head"><div><div class="small muted"><a href="#/hosts">Sunucular</a> / ${x.company_code} / ${x.hostname}</div>
         <div class="wrap" style="margin-top:6px"><h1>${x.hostname}</h1>${badge(x.status, STATUS[x.status])}</div>
         <p>${x.company_name} · <span class="mono">${x.ip || '—'}</span> · ${x.os || 'bilinmeyen işletim sistemi'} · ajan ${x.agent_version || '—'}</p></div>
@@ -237,20 +237,20 @@ const views = {
       <td class="num ${s.ssh_fail ? 't-warn' : ''}">${nf.format(s.ssh_fail)}</td><td class="small muted">${ago(d.now, s.last)}</td></tr>`);
     const ports = d.ports.map((p) => h`<tr><td class="mono">${portName(p.port)}</td><td>${p.open ? badge('ok', 'Açık') : badge('down', 'Kapalı')}</td><td class="num">${nf.format(p.attempts)}</td><td class="num">${p.sources}</td></tr>`);
     const users = d.users.map((u) => h`<tr><td class="mono">${u.user}</td><td class="num">${nf.format(u.attempts)}</td><td class="num">${u.sources}</td></tr>`);
-    const kind = (e) => (e.kind === 'ssh_fail' ? badge('warn', 'SSH başarısız') : e.kind === 'ssh_ok' ? badge('ok', 'SSH girişi') : e.open ? badge('info', 'Bağlantı') : badge('down', 'Kapalı port'));
+    const kind = (e) => (e.kind === 'ssh_fail' ? badge('warn', 'Giriş başarısız') : e.kind === 'ssh_ok' ? badge('ok', 'Başarılı giriş') : e.open ? badge('info', 'Bağlantı') : badge('down', 'Kapalı port'));
     const recent = d.recent.map((e) => h`<tr><td class="small muted">${fmtTime(e.ts)}</td><td>${kind(e)}</td><td class="mono">${e.src}</td><td class="mono">${portName(e.port)}${e.user ? h` · ${e.user}` : ''}</td><td>${e.hostname}<span class="muted small"> · ${e.company_code}</span></td><td class="num">${nf.format(e.count)}</td></tr>`);
-    const parts = [{ key: 'open', label: 'Açık porta', color: '#5AA9FF' }, { key: 'closed', label: 'Kapalı porta', color: '#FF7A6B' }, { key: 'ssh_fail', label: 'SSH başarısız', color: '#F2B84B' }];
+    const parts = [{ key: 'open', label: 'Açık porta', color: '#5AA9FF' }, { key: 'closed', label: 'Kapalı porta', color: '#FF7A6B' }, { key: 'ssh_fail', label: 'Başarısız giriş', color: '#F2B84B' }];
     return h`<header class="head"><div><h1>Bağlantı Analizi</h1><p>Sunuculara gelen tüm bağlantı denemeleri${ui.connHost ? h` · tek sunucu filtresi açık (<a href="#/connections" data-act="conn-host" data-value="">kaldır</a>)` : ''}</p></div>
       <div class="wrap" role="group" aria-label="Zaman aralığı">${pill('hours', '1', String(ui.hours), '1 saat')}${pill('hours', '24', String(ui.hours), '24 saat')}${pill('hours', '168', String(ui.hours), '7 gün')}</div></header>
     <section class="row" aria-label="Bağlantı özeti">
       <div class="card kpi"><div class="label">Bağlantı denemesi</div><div class="value">${nf.format(t.attempts)}</div><div class="note">${t.sources} farklı kaynak</div></div>
       <div class="card kpi"><div class="label">Kapalı porta gelen</div><div class="value ${t.closed ? 't-crit' : ''}">${nf.format(t.closed)}</div><div class="note">Tarama veya yanlış yapılandırma işareti</div></div>
-      <div class="card kpi"><div class="label">Başarısız SSH girişi</div><div class="value ${t.ssh_fail ? 't-warn' : ''}">${nf.format(t.ssh_fail)}</div><div class="note">${nf.format(t.ssh_ok)} başarılı giriş</div></div></section>
+      <div class="card kpi"><div class="label">Başarısız oturum açma</div><div class="value ${t.ssh_fail ? 't-warn' : ''}">${nf.format(t.ssh_fail)}</div><div class="note">${nf.format(t.ssh_ok)} başarılı giriş</div></div></section>
     <section class="card"><div class="wrap between"><h2>Zaman içinde denemeler</h2><div class="legend">${parts.map((p) => h`<span><i style="background:${p.color}"></i>${p.label}</span>`)}</div></div>
       ${t.attempts + t.ssh_fail ? barChart(d.timeline, parts, 'Zaman içinde bağlantı denemeleri') : empty('Bu aralıkta kayıtlı bağlantı denemesi yok.')}</section>
-    <div class="row"><section class="card grow2"><h2>En çok deneyen kaynaklar</h2>${src.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:620px"><thead><tr><th>Kaynak IP</th><th>Konum</th><th class="num">Deneme</th><th class="num">Port</th><th class="num">Kapalı</th><th class="num">SSH hata</th><th>Son</th></tr></thead><tbody>${src}</tbody></table></div>` : empty('Kayıt yok.')}</section>
+    <div class="row"><section class="card grow2"><h2>En çok deneyen kaynaklar</h2>${src.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:620px"><thead><tr><th>Kaynak IP</th><th>Konum</th><th class="num">Deneme</th><th class="num">Port</th><th class="num">Kapalı</th><th class="num">Giriş hatası</th><th>Son</th></tr></thead><tbody>${src}</tbody></table></div>` : empty('Kayıt yok.')}</section>
       <section class="card grow1"><h2>Hedef portlar</h2>${ports.length ? h`<table style="margin-top:12px"><thead><tr><th>Port</th><th>Durum</th><th class="num">Deneme</th><th class="num">Kaynak</th></tr></thead><tbody>${ports}</tbody></table>` : empty('Kayıt yok.')}
-        ${users.length ? h`<h2 style="margin-top:20px">Denenen SSH kullanıcıları</h2><table style="margin-top:12px"><thead><tr><th>Kullanıcı</th><th class="num">Deneme</th><th class="num">Kaynak</th></tr></thead><tbody>${users}</tbody></table>` : ''}</section></div>
+        ${users.length ? h`<h2 style="margin-top:20px">Denenen kullanıcı adları</h2><table style="margin-top:12px"><thead><tr><th>Kullanıcı</th><th class="num">Deneme</th><th class="num">Kaynak</th></tr></thead><tbody>${users}</tbody></table>` : ''}</section></div>
     <section class="card"><h2>Son kayıtlar</h2>${recent.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:720px"><thead><tr><th>Zaman</th><th>Tür</th><th>Kaynak</th><th>Hedef</th><th>Sunucu</th><th class="num">Adet</th></tr></thead><tbody>${recent}</tbody></table></div>` : empty('Kayıt yok.')}</section>`;
   },
 
@@ -279,7 +279,8 @@ const views = {
       <td><button type="button" class="btn" data-act="rotate" data-value="${x.id}" data-code="${x.code}">Anahtarı yenile</button></td></tr>`);
     const tokenBox = ui.newToken ? h`<div class="notice" role="status"><b>${ui.newToken.code} için ajan anahtarı</b> — yalnızca şimdi gösterilir, kaydedin:
       <p><code>${ui.newToken.token}</code></p><div class="small muted">Sunucuda kurulum:</div>
-      <p style="margin-bottom:0"><code>sudo ./agent/install.sh ${location.origin} ${ui.newToken.token}</code></p></div>` : '';
+      <p><code>sudo ./agent/install.sh ${location.origin} ${ui.newToken.token}</code></p><div class="small muted">Windows sunucuda (yönetici PowerShell):</div>
+      <p style="margin-bottom:0"><code>.\\agent\\windows\\install.ps1 -Manager ${location.origin} -Token ${ui.newToken.token} -EnableConnectionAudit</code></p></div>` : '';
     const num = (key, label) => h`<label class="field"><span>${label}</span><input type="number" min="0" step="1" name="${key}" value="${s[key]}"></label>`;
     return h`<header class="head"><div><h1>Ayarlar</h1><p>Şirketler, ajan anahtarları, bildirim kanalları ve uyarı eşikleri.</p></div></header>
     <section class="card" style="display:flex;flex-direction:column;gap:16px"><h2>Şirketler</h2>${tokenBox}
@@ -296,7 +297,7 @@ const views = {
         <label class="check" style="flex:1 1 200px"><input type="checkbox" name="notify_warn" ${s.notify_warn >= 1 ? new Raw('checked') : ''}>"Uyarı" seviyesini de bildir</label></div>
       <h2>Uyarı eşikleri</h2>
       <div class="row">${num('disk_warn', 'Disk uyarı (%)')}${num('disk_crit', 'Disk kritik (%)')}${num('cpu_warn', 'CPU uyarı (%)')}${num('mem_warn', 'Bellek uyarı (%)')}</div>
-      <div class="row">${num('offline_seconds', 'Sunucu çevrimdışı sayılma süresi (sn)')}${num('device_offline_seconds', 'İzlenen cihaz çevrimdışı süresi (sn)')}${num('scan_ports', 'Port taraması eşiği (10 dk içinde port)')}${num('brute_fails', 'SSH saldırısı eşiği (10 dk içinde hata)')}</div>
+      <div class="row">${num('offline_seconds', 'Sunucu çevrimdışı sayılma süresi (sn)')}${num('device_offline_seconds', 'İzlenen cihaz çevrimdışı süresi (sn)')}${num('scan_ports', 'Port taraması eşiği (10 dk içinde port)')}${num('brute_fails', 'Parola saldırısı eşiği (10 dk içinde hata)')}</div>
       <div class="wrap"><button class="btn primary">Ayarları kaydet</button><button type="button" class="btn" data-act="test-notify">Test bildirimi gönder</button></div></form>`;
   },
 };

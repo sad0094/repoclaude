@@ -218,6 +218,25 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(data["totals"]["ssh_ok"], 1)
         self.assertEqual(data["users"][0]["user"], "root")
 
+    def test_windows_agent_report_shape(self):
+        """Windows ajanının gönderdiği biçim: sürücü harfli diskler, audit modu, portsuz oturum açma."""
+        win = report("WIN-DC01", capture_mode="audit",
+                     connections=[{"src": "10.0.0.7", "port": 3389, "count": 2, "open": True},
+                                  {"src": "203.0.113.9", "port": 445, "count": 3, "open": False}],
+                     auth=[{"src": "198.51.100.4", "user": "Administrator", "result": "fail", "count": 11, "service": "windows"},
+                           {"src": "10.0.0.7", "user": "ayse", "result": "ok", "count": 1, "service": "windows", "port": 3389}])
+        win["metrics"]["disks"] = [{"mount": "C:", "total": 100, "used": 95, "pct": 95.0}]
+        del win["metrics"]["load1"]
+        self.call("/api/agent/report", win, token=self.xxxx["token"])
+        alerts = self.open_alerts()
+        self.assertIn("disk:C:", alerts)
+        self.assertIn("brute:198.51.100.4", alerts)
+        host = self.call("/api/hosts")["hosts"][0]
+        self.assertEqual((host["hostname"], host["capture_mode"]), ("WIN-DC01", "audit"))
+        recent = {(e["kind"], e["src"]): e["port"] for e in self.call("/api/connections?hours=1")["recent"]}
+        self.assertIsNone(recent[("ssh_fail", "198.51.100.4")])
+        self.assertEqual(recent[("ssh_ok", "10.0.0.7")], 3389)
+
     def test_malformed_agent_data_is_dropped(self):
         bad = report(connections=[{"src": "<script>", "port": 22, "count": 1}, {"src": "1.2.3.4", "port": 99999, "count": 1},
                                   "x", {"src": "1.2.3.4", "port": 80, "count": 2}],

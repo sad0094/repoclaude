@@ -223,9 +223,11 @@ class Engine:
             src, count = _ip(e.get("src")), _i(e.get("count"), 1, 10**9)
             if not (src and count):
                 continue
+            # kind adları tarihsel: ssh_fail/ssh_ok her türlü oturum açma denemesini (SSH, RDP, Windows ağ) taşır.
             kind = "ssh_ok" if e.get("result") == "ok" else "ssh_fail"
+            port = _port(e.get("port")) or (None if e.get("service") == "windows" else 22)
             c.execute("INSERT INTO conn_events(company_id,host_id,ts,kind,src,port,user,open,count) "
-                      "VALUES(?,?,?,?,?,22,?,1,?)", (cid, hid, now, kind, src, _s(e.get("user"), 64), count))
+                      "VALUES(?,?,?,?,?,?,?,1,?)", (cid, hid, now, kind, src, port, _s(e.get("user"), 64), count))
             if kind == "ssh_fail":
                 fail_sources.add(src)
 
@@ -243,7 +245,7 @@ class Engine:
                 "SELECT COALESCE(SUM(count),0) n, COUNT(DISTINCT user) users FROM conn_events "
                 "WHERE host_id=? AND kind='ssh_fail' AND src=? AND ts>=?", (hid, src, since)).fetchone()
             if row["n"] >= cfg["brute_fails"]:
-                self.raise_alert(c, cid, hid, "brute:" + src, "crit", f"SSH parola denemesi saldırısı: {src}",
+                self.raise_alert(c, cid, hid, "brute:" + src, "crit", f"Parola denemesi saldırısı: {src}",
                                  f"Son 10 dakikada {row['n']} başarısız giriş, {row['users']} farklı kullanıcı adı",
                                  now, expire_after=1800)
 

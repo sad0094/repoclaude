@@ -17,8 +17,8 @@ Bağlantıyı her zaman Agent başlatır; şirket ağlarında dışarıya port a
 | --- | --- |
 | Sunucu sağlığı | CPU, bellek, disk bölümleri, ağ trafiği, çalışma süresi; 24 saatlik grafikler |
 | Ağ cihazları | Agent yerel alt ağı tarar (ARP), ağdaki tüm cihazları IP/MAC/ad ile listeler; yeni cihaz bilgi uyarısı üretir; "İzle" denen cihaz kaybolursa kritik uyarı |
-| Bağlantı analizi | Sunucuya gelen her TCP bağlantı denemesi (kapalı portlara gelenler dahil), SSH başarılı/başarısız girişler; kaynak, port, kullanıcı adı ve zaman dökümü |
-| Saldırı tespiti | Port taraması (10 dk içinde 15+ farklı port) ve SSH parola denemesi (10 dk içinde 10+ hata) kritik uyarı üretir |
+| Bağlantı analizi | Sunucuya gelen her TCP bağlantı denemesi (kapalı portlara gelenler dahil), başarılı/başarısız oturum açmalar (Linux: SSH, Windows: RDP ve ağ); kaynak, port, kullanıcı adı ve zaman dökümü |
+| Saldırı tespiti | Port taraması (10 dk içinde 15+ farklı port) ve parola denemesi saldırısı (10 dk içinde 10+ başarısız giriş) kritik uyarı üretir |
 | Çok şirketli yönetim | Her şirketin kendi kodu ve ajan anahtarı vardır; panel tüm şirketleri birlikte veya tek tek gösterir |
 | Acil durum çağrısı | Kritik uyarılar Telegram botuna (ve isteğe bağlı webhook'a) gider; onaylanana kadar 15 dakikada bir tekrarlanır; şirket başına ayrı sohbet seçilebilir |
 
@@ -61,6 +61,27 @@ sudo python3 agent/nobet_agent.py --manager https://panel.example.com --token nb
 `subnets` (taranacak alt ağlar; boşsa otomatik), `capture` / `discovery` (`false` ile kapatılır),
 `ca_file` (özel CA sertifikası).
 
+### Windows sunucu
+
+`agent/windows/` klasörünü sunucuya kopyalayın ve **yönetici** PowerShell'den çalıştırın
+(Windows Server 2016+; ek kurulum gerekmez, Windows PowerShell 5.1 yeterlidir):
+
+```powershell
+.\install.ps1 -Manager https://panel.example.com -Token nbt_ANAHTAR -EnableConnectionAudit
+```
+
+Betik ajanı `C:\Program Files\Nobet` altına kopyalar, ayarı `C:\ProgramData\Nobet\agent.json`
+dosyasına yazar (yalnızca SYSTEM ve Administrators okur) ve açılışta SYSTEM olarak çalışan
+`NobetAgent` zamanlanmış görevini başlatır. Günlük: `C:\ProgramData\Nobet\agent.log`.
+
+`-EnableConnectionAudit`, izin verilen **ve engellenen** tüm bağlantı denemelerinin görülebilmesi için
+Windows güvenlik duvarı denetim kayıtlarını (5156/5157/5152) açar. Bu, Security günlüğüne çok sayıda
+kayıt yazar; günlük boyutunu buna göre ayarlayın. Anahtar verilmezse ajan yalnızca kurulan
+bağlantıları görür. Oturum açma denemeleri (RDP ve ağ; olay 4625/4624) her iki durumda da izlenir.
+
+Kurmadan denemek için: `.\nobet-agent.ps1 -Manager https://... -Token nbt_... -Print`.
+Kaldırmak için: `.\uninstall.ps1`.
+
 ## Telegram
 
 1. Telegram'da @BotFather ile bot oluşturup anahtarını alın.
@@ -84,7 +105,10 @@ python3 tools/demo.py http://127.0.0.1:8080 nbt_ANAHTAR
 
 ## Bilinen sınırlar
 
-- Agent yalnızca Linux'ta çalışır (`/proc` ve ham soket kullanır); Windows ajanı yok.
+- **Windows ajanı (`agent/windows/`) henüz hiçbir Windows makinesinde çalıştırılmadı**; geliştirme
+  ortamında PowerShell yoktu. Üretime almadan önce bir test sunucusunda `-Print` ile deneyin.
+  Manager'ın Windows biçimli raporu işlediği otomatik testle doğrulandı.
+- Linux ajanı `/proc` ve ham soket kullanır; Windows ajanı CIM, komşu tablosu ve Security günlüğünü kullanır.
 - Bağlantı yakalama TCP içindir ve root gerektirir. Root yoksa ajan yalnızca kabul edilen
   bağlantıları görür; panel bunu sunucu sayfasında belirtir. UDP izlenmez.
 - Ağ keşfi ajanın bulunduğu alt ağla sınırlıdır (en fazla /22); yönlendirici arkasındaki ağlar görülmez.
