@@ -1,0 +1,20 @@
+[Unit]
+Description=Nöbet Manager (merkezi panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Depoyu /opt/nobet-manager altına kopyalayın; veritabanı /var/lib/nobet içinde tutulur.
+WorkingDirectory=/opt/nobet-manager
+ExecStart=/usr/bin/env python3 -m manager --host 127.0.0.1 --port 8080 --db /var/lib/nobet/nobet.db
+Restart=always
+RestartSec=5
+DynamicUser=yes
+StateDirectory=nobet
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

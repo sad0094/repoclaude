@@ -1,0 +1,76 @@
+"""Nöbet Manager: `python3 -m manager --port 8080`"""
+import argparse
+import getpass
+import os
+import secrets
+import sys
+import threading
+import time
+
+from .core import Engine
+from .db import DB, hash_password
+from .notify import Notifier
+from .web import App, make_server
+
+
+def build(db_path):
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    db = DB(db_path)
+    notifier = Notifier(db)
+    engine = Engine(db, notifier)
+    return db, notifier, engine, App(db, engine, notifier)
+
+
+def tick_loop(engine, interval=15):
+    while True:
+        time.sleep(interval)
+        try:
+            engine.tick()
+        except Exception as exc:
+            print("periyodik kontrol hatası:", repr(exc), file=sys.stderr, flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Nöbet merkezi yönetim paneli")
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--db", default=os.environ.get("NOBET_DB", "data/nobet.db"))
+    ap.add_argument("--cert", help="TLS sertifikası (PEM)")
+    ap.add_argument("--key", help="TLS özel anahtarı (PEM)")
+    ap.add_argument("--set-password", action="store_true", help="yönetici parolasını değiştir ve çık")
+    args = ap.parse_args()
+
+    db, notifier, engine, app = build(args.db)
+
+    if args.set_password:
+        password = getpass.getpass("Yeni yönetici parolası: ")
+        if len(password) < 8:
+            sys.exit("Parola en az 8 karakter olmalı.")
+        db.set("admin_hash", hash_password(password))
+        db.write("DELETE FROM sessions")
+        print("Parola güncellendi.")
+        return
+
+    if not db.get("admin_hash"):
+        password = os.environ.get("NOBET_ADMIN_PASSWORD") or secrets.token_urlsafe(12)
+        db.set("admin_hash", hash_password(password))
+        if not os.environ.get("NOBET_ADMIN_PASSWORD"):
+            print(f"İlk kurulum: yönetici parolası oluşturuldu -> {password}\n"
+                  "Bu parola bir daha gösterilmez; değiştirmek için --set-password kullanın.", flush=True)
+
+    notifier.start()
+    threading.Thread(target=tick_loop, args=(engine,), daemon=True, name="tick").start()
+    server = make_server(app, args.host, args.port, args.cert, args.key)
+    scheme = "https" if args.cert else "http"
+    print(f"Nöbet Manager {scheme}://{args.host}:{args.port} adresinde çalışıyor (veritabanı: {args.db})", flush=True)
+    if not args.cert:
+        print("Uyarı: TLS kapalı. Ajan anahtarları açık metin gider; --cert/--key verin "
+              "veya TLS sonlandıran bir ters vekil kullanın.", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

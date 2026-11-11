@@ -1,0 +1,19 @@
+[Unit]
+Description=Nöbet Agent (IT monitörleme toplayıcısı)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/env python3 /opt/nobet/nobet_agent.py --config /etc/nobet/agent.json
+Restart=always
+RestartSec=10
+# Bağlantı yakalama (ham soket) ve auth günlüğünü okumak için root gerekir; yetkiler daraltılmıştır.
+User=root
+CapabilityBoundingSet=CAP_NET_RAW CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
