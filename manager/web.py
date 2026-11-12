@@ -10,13 +10,17 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .db import DEFAULTS, NUMERIC, check_password, sha256
+from .db import DEFAULTS, NUMERIC, check_password, hash_password, sha256
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 SESSION_TTL = 7 * 86400
 MAX_BODY = 4 * 1024 * 1024
 COOKIE = "nobet_session"
 CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{1,23}$")
+USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
+ROLES = ("admin", "operator", "viewer")   # yönetici, operatör, izleyici
+# Kullanıcı yokken de aynı süre harcansın diye doğrulanan sahte özet (kullanıcı adı sızdırmamak için).
+DUMMY_HASH = hash_password("nobet-dummy")
 
 
 INTERNAL_NETS = [ipaddress.ip_network(n) for n in
@@ -43,39 +47,154 @@ class App:
         self._fails_lock = threading.Lock()
 
     # ------------------------------------------------------------------ oturum
-    def login(self, password, client):
+    def login(self, username, password, client):
         now = time.time()
         with self._fails_lock:
             recent = [t for t in self._fails.get(client, []) if t > now - 60]
             if len(recent) >= 5:
                 raise HttpError(429, "Çok fazla hatalı deneme. Bir dakika sonra tekrar deneyin.")
-            if not check_password(password, self.db.get("admin_hash")):
+            user = self.db.one("SELECT * FROM users WHERE username=? AND active=1", (username.strip().lower(),))
+            if not check_password(password, user["password_hash"] if user else DUMMY_HASH) or not user:
                 self._fails[client] = recent + [now]
-                raise HttpError(401, "Parola hatalı.")
+                raise HttpError(401, "Kullanıcı adı veya parola hatalı.")
             self._fails.pop(client, None)
         token = secrets.token_urlsafe(32)
-        self.db.write("INSERT INTO sessions(token_hash,created_at,expires_at) VALUES(?,?,?)",
-                      (sha256(token), now, now + SESSION_TTL))
+        with self.db.tx() as c:
+            c.execute("INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",
+                      (sha256(token), user["id"], now, now + SESSION_TTL))
+            c.execute("UPDATE users SET last_login=? WHERE id=?", (now, user["id"]))
         return token
 
-    def session_valid(self, token):
+    def session_user(self, token):
+        """Geçerli oturumun kullanıcısı; `companies` None ise tüm şirketlere erişir."""
         if not token:
-            return False
-        return self.db.one("SELECT 1 FROM sessions WHERE token_hash=? AND expires_at>?",
-                           (sha256(token), time.time())) is not None
+            return None
+        user = self.db.one(
+            "SELECT u.id, u.username, u.role, u.all_companies FROM sessions s JOIN users u ON u.id=s.user_id "
+            "WHERE s.token_hash=? AND s.expires_at>? AND u.active=1", (sha256(token), time.time()))
+        if user:
+            everything = user["role"] == "admin" or user["all_companies"]
+            user["companies"] = None if everything else set(self.db.user_company_ids(user["id"]))
+        return user
+
+    @staticmethod
+    def can_access(user, company_id):
+        return user["companies"] is None or company_id in user["companies"]
+
+    # ------------------------------------------------------------------ kullanıcı yönetimi
+    def users(self):
+        rows = self.db.q("SELECT id, username, role, all_companies, active, created_at, last_login "
+                         "FROM users ORDER BY username")
+        for r in rows:
+            r["companies"] = self.db.user_company_ids(r["id"])
+        return rows
+
+    def _company_ids(self, body):
+        """İstekteki şirket seçimini doğrular; None = tüm şirketler."""
+        if body.get("all_companies"):
+            return None
+        known = {c["id"] for c in self.db.q("SELECT id FROM companies")}
+        try:
+            ids = {int(x) for x in (body.get("companies") or [])}
+        except (TypeError, ValueError):
+            raise HttpError(400, "Geçersiz şirket seçimi.")
+        if not ids <= known:
+            raise HttpError(400, "Bilinmeyen şirket.")
+        return sorted(ids)
+
+    @staticmethod
+    def _check_password_rule(password):
+        if len(password) < 8:
+            raise HttpError(400, "Parola en az 8 karakter olmalı.")
+
+    def create_user(self, body):
+        username = str(body.get("username", "")).strip().lower()
+        role, password = body.get("role"), str(body.get("password", ""))
+        if not USER_RE.match(username):
+            raise HttpError(400, "Kullanıcı adı 3-32 karakter olmalı; küçük harf, rakam, nokta, - ve _ kullanılabilir.")
+        if role not in ROLES:
+            raise HttpError(400, "Geçersiz rol.")
+        self._check_password_rule(password)
+        if self.db.one("SELECT 1 FROM users WHERE username=?", (username,)):
+            raise HttpError(409, "Bu kullanıcı adı zaten var.")
+        company_ids = None if role == "admin" else self._company_ids(body)
+        return {"id": self.db.create_user(username, password, role, company_ids)}
+
+    def update_user(self, user_id, body, actor):
+        target = self.db.one("SELECT * FROM users WHERE id=?", (user_id,))
+        if not target:
+            raise HttpError(404, "Kullanıcı bulunamadı.")
+        role = body.get("role", target["role"])
+        active = (1 if body["active"] else 0) if "active" in body else target["active"]
+        if role not in ROLES:
+            raise HttpError(400, "Geçersiz rol.")
+        self._guard_last_admin(target, role, active)
+        if target["id"] == actor["id"] and not active:
+            raise HttpError(400, "Kendi hesabınızı devre dışı bırakamazsınız.")
+        if "password" in body and body["password"] != "":
+            self._check_password_rule(str(body["password"]))
+            self.db.write("UPDATE users SET password_hash=? WHERE id=?", (hash_password(str(body["password"])), user_id))
+            self.db.write("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        self.db.write("UPDATE users SET role=?, active=? WHERE id=?", (role, active, user_id))
+        if role == "admin":
+            self.db.set_user_companies(user_id, None)
+        elif "companies" in body or "all_companies" in body or target["role"] == "admin":
+            self.db.set_user_companies(user_id, self._company_ids(body))
+        if not active:
+            self.db.write("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        return {"ok": True}
+
+    def delete_user(self, user_id, actor):
+        target = self.db.one("SELECT * FROM users WHERE id=?", (user_id,))
+        if not target:
+            raise HttpError(404, "Kullanıcı bulunamadı.")
+        if target["id"] == actor["id"]:
+            raise HttpError(400, "Kendi hesabınızı silemezsiniz.")
+        self._guard_last_admin(target, "viewer", 0)
+        with self.db.tx() as c:
+            c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            c.execute("DELETE FROM user_companies WHERE user_id=?", (user_id,))
+            c.execute("DELETE FROM users WHERE id=?", (user_id,))
+        return {"ok": True}
+
+    def _guard_last_admin(self, target, new_role, new_active):
+        """Sistemde her zaman en az bir etkin yönetici kalmalı."""
+        if target["role"] == "admin" and target["active"] and (new_role != "admin" or not new_active):
+            others = self.db.one("SELECT COUNT(*) n FROM users WHERE role='admin' AND active=1 AND id<>?",
+                                 (target["id"],))["n"]
+            if not others:
+                raise HttpError(400, "Son etkin yönetici hesabı değiştirilemez.")
+
+    def change_own_password(self, user, body, keep_token):
+        row = self.db.one("SELECT password_hash FROM users WHERE id=?", (user["id"],))
+        if not check_password(str(body.get("current", "")), row["password_hash"]):
+            raise HttpError(400, "Mevcut parola hatalı.")
+        self._check_password_rule(str(body.get("password", "")))
+        self.db.write("UPDATE users SET password_hash=? WHERE id=?", (hash_password(str(body["password"])), user["id"]))
+        # Diğer cihazlardaki oturumlar kapanır, bu oturum açık kalır.
+        self.db.write("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (user["id"], sha256(keep_token)))
+        return {"ok": True}
 
     # ------------------------------------------------------------------ sorgular
-    def _scope(self, query, column="company_id"):
+    def _scope(self, user, query, column="company_id"):
+        """Şirket filtresi: istenen şirket ile kullanıcının yetkili olduğu şirketlerin kesişimi."""
+        allowed = user["companies"]
         company = query.get("company")
         if company and company.isdigit():
+            if allowed is not None and int(company) not in allowed:
+                return " AND 0", []
             return f" AND {column}=?", [int(company)]
-        return "", []
+        if allowed is None:
+            return "", []
+        if not allowed:
+            return " AND 0", []
+        return f" AND {column} IN ({','.join('?' * len(allowed))})", sorted(allowed)
 
     def _online_after(self):
         return time.time() - self.db.num("offline_seconds")
 
-    def hosts(self, query):
-        clause, args = self._scope(query, "h.company_id")
+    def hosts(self, user, query):
+        clause, args = self._scope(user, query, "h.company_id")
         rows = self.db.q(
             "SELECT h.*, c.code company_code, c.name company_name, "
             "(SELECT COUNT(*) FROM alerts a WHERE a.host_id=h.id AND a.resolved_at IS NULL AND a.severity='crit') crit, "
@@ -90,8 +209,8 @@ class App:
             r["status"] = "down" if not r["online"] else "crit" if r["crit"] else "warn" if r["warn"] else "ok"
         return rows
 
-    def alerts(self, query, limit=200):
-        clause, args = self._scope(query, "a.company_id")
+    def alerts(self, user, query, limit=200):
+        clause, args = self._scope(user, query, "a.company_id")
         if query.get("state") == "resolved":
             clause += " AND a.resolved_at IS NOT NULL"
             order = "a.resolved_at DESC"
@@ -106,8 +225,8 @@ class App:
             "JOIN companies c ON c.id=a.company_id LEFT JOIN hosts h ON h.id=a.host_id "
             f"WHERE 1=1{clause} ORDER BY {order} LIMIT {int(limit)}", args)
 
-    def devices(self, query):
-        clause, args = self._scope(query, "d.company_id")
+    def devices(self, user, query):
+        clause, args = self._scope(user, query, "d.company_id")
         rows = self.db.q(
             "SELECT d.*, c.code company_code, h.hostname seen_by, h.last_scan, h.last_seen host_seen "
             "FROM devices d JOIN companies c ON c.id=d.company_id JOIN hosts h ON h.id=d.host_id "
@@ -120,8 +239,8 @@ class App:
         rows.sort(key=lambda r: (r["company_code"], ipaddress.ip_address(r["ip"]).packed))
         return rows
 
-    def traffic(self, query, host_id=None, hours=24, bucket=600):
-        clause, args = self._scope(query, "h.company_id")
+    def traffic(self, user, query, host_id=None, hours=24, bucket=600):
+        clause, args = self._scope(user, query, "h.company_id")
         if host_id:
             clause += " AND h.id=?"
             args.append(host_id)
@@ -132,18 +251,19 @@ class App:
             " FROM metrics m JOIN hosts h ON h.id=m.host_id WHERE m.ts>=?" + clause +
             " GROUP BY m.host_id, b) GROUP BY b ORDER BY b", [bucket, bucket, since] + args)
 
-    def overview(self, query):
-        hosts = self.hosts(query)
-        devices = self.devices(query)
-        open_alerts = self.alerts(query, limit=1000)
-        clause, args = self._scope(query)
+    def overview(self, user, query):
+        hosts = self.hosts(user, query)
+        devices = self.devices(user, query)
+        open_alerts = self.alerts(user, query, limit=1000)
+        clause, args = self._scope(user, query)
         conn = self.db.one(
             "SELECT COALESCE(SUM(count),0) attempts, COALESCE(SUM(CASE WHEN open=0 THEN count END),0) closed "
             "FROM conn_events WHERE kind='tcp' AND ts>=?" + clause, [time.time() - 86400] + args)
         companies = []
-        for c in self.db.q("SELECT id, code, name FROM companies ORDER BY code"):
+        for c in self.companies(user):
+            c = {k: c[k] for k in ("id", "code", "name")}
             own = [h for h in hosts if h["company_id"] == c["id"]]
-            if query.get("company") and not own and str(c["id"]) != query["company"]:
+            if query.get("company") and str(c["id"]) != query["company"]:
                 continue
             companies.append({
                 **c, "hosts_total": len(own), "hosts_online": sum(h["online"] for h in own),
@@ -158,27 +278,27 @@ class App:
                 "devices_total": len(devices), "devices_online": sum(1 for d in devices if d["online"]),
                 "alerts": {s: sum(1 for a in open_alerts if a["severity"] == s) for s in ("crit", "warn", "info")},
                 "attempts_24h": conn["attempts"], "closed_24h": conn["closed"]},
-            "companies": companies, "traffic": self.traffic(query),
+            "companies": companies, "traffic": self.traffic(user, query),
             "alerts": open_alerts[:6], "hosts": hosts}
 
-    def host_detail(self, host_id):
-        rows = [h for h in self.hosts({}) if h["id"] == host_id]
+    def host_detail(self, user, host_id):
+        rows = [h for h in self.hosts(user, {}) if h["id"] == host_id]   # yetkisiz şirket -> 404
         if not rows:
             raise HttpError(404, "Sunucu bulunamadı.")
         host = rows[0]
         events = self.db.q(
             "SELECT * FROM alerts WHERE host_id=? ORDER BY started_at DESC LIMIT 12", (host_id,))
-        return {"now": time.time(), "host": host, "series": self.traffic({}, host_id=host_id),
+        return {"now": time.time(), "host": host, "series": self.traffic(user, {}, host_id=host_id),
                 "alerts": events}
 
-    def connections(self, query):
+    def connections(self, user, query):
         try:
             hours = max(1, min(720, int(query.get("hours", "24"))))
         except ValueError:
             hours = 24
         now = time.time()
         since = now - hours * 3600
-        clause, args = self._scope(query, "e.company_id")
+        clause, args = self._scope(user, query, "e.company_id")
         if query.get("host", "").isdigit():
             clause += " AND e.host_id=?"
             args.append(int(query["host"]))
@@ -218,10 +338,14 @@ class App:
         return {"now": now, "hours": hours, "totals": totals, "sources": sources, "ports": ports,
                 "users": users, "timeline": timeline, "recent": recent}
 
-    def companies(self):
-        return self.db.q(
+    def companies(self, user):
+        rows = self.db.q(
             "SELECT c.id, c.code, c.name, c.token_hint, c.telegram_chat_id, c.created_at, "
             "(SELECT COUNT(*) FROM hosts h WHERE h.company_id=c.id) hosts FROM companies c ORDER BY c.code")
+        rows = [r for r in rows if self.can_access(user, r["id"])]
+        if user["role"] != "admin":   # anahtar ipucu ve bildirim ayarları yalnızca yöneticiye
+            rows = [{k: r[k] for k in ("id", "code", "name", "hosts")} for r in rows]
+        return rows
 
     def create_company(self, body):
         code = str(body.get("code", "")).strip().upper()
@@ -319,8 +443,10 @@ def make_handler(app):
             return ("Set-Cookie", f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}")
 
         def _require_session(self):
-            if not app.session_valid(self._session_token()):
+            user = app.session_user(self._session_token())
+            if not user:
                 raise HttpError(401, "Oturum gerekli.")
+            return user
 
         def _static(self, path):
             name = "index.html" if path == "/" else os.path.basename(path)
@@ -361,7 +487,9 @@ def make_handler(app):
                 app.engine.ingest(company, self._body())
                 return self._send(200, {"ok": True, "company": company["code"]})
             if (method, path) == ("POST", "/api/login"):
-                token = app.login(str(self._body().get("password", "")), self.client_address[0])
+                body = self._body()
+                token = app.login(str(body.get("username", "")), str(body.get("password", "")),
+                                  self.client_address[0])
                 return self._send(200, {"ok": True}, headers=[self._cookie(token, SESSION_TTL)])
             if (method, path) == ("POST", "/api/logout"):
                 token = self._session_token()
@@ -369,45 +497,80 @@ def make_handler(app):
                     app.db.write("DELETE FROM sessions WHERE token_hash=?", (sha256(token),))
                 return self._send(200, {"ok": True}, headers=[self._cookie("", 0)])
 
-            self._require_session()
+            user = self._require_session()
             m = re.fullmatch(r"/api/(\w+)(?:/(\d+))?(?:/(\w+))?", path)
             if not m:
                 raise HttpError(404, "Bulunamadı.")
             resource, rid, action = m.group(1), int(m.group(2)) if m.group(2) else None, m.group(3)
+            is_admin = user["role"] == "admin"
+
+            def admin_only():
+                if not is_admin:
+                    raise HttpError(403, "Bu işlem için yönetici yetkisi gerekli.")
+
+            def owned(table, row_id):
+                """Kayıt kullanıcının yetkili olduğu bir şirkete ait değilse 404 (varlığını da sızdırma)."""
+                row = app.db.one(f"SELECT company_id FROM {table} WHERE id=?", (row_id,))
+                if not row or not app.can_access(user, row["company_id"]):
+                    raise HttpError(404, "Bulunamadı.")
 
             if method == "GET":
                 if resource == "me":
-                    return self._send(200, {"ok": True})
+                    return self._send(200, {"id": user["id"], "username": user["username"], "role": user["role"],
+                                            "all_companies": user["companies"] is None,
+                                            "companies": sorted(user["companies"] or [])})
                 if resource == "overview":
-                    return self._send(200, app.overview(query))
+                    return self._send(200, app.overview(user, query))
                 if resource == "hosts" and rid:
-                    return self._send(200, app.host_detail(rid))
+                    return self._send(200, app.host_detail(user, rid))
                 if resource == "hosts":
-                    return self._send(200, {"now": time.time(), "hosts": app.hosts(query)})
+                    return self._send(200, {"now": time.time(), "hosts": app.hosts(user, query)})
                 if resource == "devices":
-                    return self._send(200, {"now": time.time(), "devices": app.devices(query)})
+                    return self._send(200, {"now": time.time(), "devices": app.devices(user, query)})
                 if resource == "connections":
-                    return self._send(200, app.connections(query))
+                    return self._send(200, app.connections(user, query))
                 if resource == "alerts":
-                    return self._send(200, {"now": time.time(), "alerts": app.alerts(query)})
+                    return self._send(200, {"now": time.time(), "alerts": app.alerts(user, query)})
                 if resource == "companies":
-                    return self._send(200, {"companies": app.companies()})
+                    return self._send(200, {"companies": app.companies(user)})
                 if resource == "settings":
+                    admin_only()
                     return self._send(200, app.settings_view())
+                if resource == "users":
+                    admin_only()
+                    return self._send(200, {"users": app.users()})
                 raise HttpError(404, "Bulunamadı.")
 
             if method != "POST":
                 raise HttpError(405, "Desteklenmeyen yöntem.")
             body = self._body()
+            if resource == "me" and action == "password":
+                return self._send(200, app.change_own_password(user, body, self._session_token()))
+            if user["role"] == "viewer":
+                raise HttpError(403, "İzleyici rolü değişiklik yapamaz.")
+
+            # --- operatör ve yönetici: kendi şirketlerindeki uyarı ve cihazlar ---
             if resource == "alerts" and rid and action == "ack":
-                app.db.write("UPDATE alerts SET acked_at=? WHERE id=? AND acked_at IS NULL", (time.time(), rid))
+                owned("alerts", rid)
+                app.db.write("UPDATE alerts SET acked_at=?, acked_by=? WHERE id=? AND acked_at IS NULL",
+                             (time.time(), user["username"], rid))
                 return self._send(200, {"ok": True})
             if resource == "devices" and rid:
+                owned("devices", rid)
                 if "watched" in body:
                     app.db.write("UPDATE devices SET watched=? WHERE id=?", (1 if body["watched"] else 0, rid))
                 if "label" in body:
                     app.db.write("UPDATE devices SET label=? WHERE id=?", (str(body["label"]).strip()[:80], rid))
                 return self._send(200, {"ok": True})
+
+            # --- yalnızca yönetici ---
+            admin_only()
+            if resource == "users" and rid and action == "delete":
+                return self._send(200, app.delete_user(rid, user))
+            if resource == "users" and rid:
+                return self._send(200, app.update_user(rid, body, user))
+            if resource == "users":
+                return self._send(201, app.create_user(body))
             if resource == "companies" and rid and action == "token":
                 if not app.db.one("SELECT 1 FROM companies WHERE id=?", (rid,)):
                     raise HttpError(404, "Şirket bulunamadı.")

@@ -61,7 +61,22 @@ CREATE TABLE IF NOT EXISTS alerts(
 );
 CREATE INDEX IF NOT EXISTS alerts_open ON alerts(company_id, resolved_at);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, created_at REAL, expires_at REAL);
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL,                 -- admin | operator | viewer
+  all_companies INTEGER DEFAULT 0,    -- 1: tüm şirketler (admin için her zaman geçerli)
+  active INTEGER DEFAULT 1,
+  created_at REAL, last_login REAL
+);
+CREATE TABLE IF NOT EXISTS user_companies(
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  PRIMARY KEY(user_id, company_id)
+);
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+                                    created_at REAL, expires_at REAL);
 """
 
 # Panelden değiştirilebilen ayarlar ve varsayılanları.
@@ -99,7 +114,23 @@ class DB:
         self.path = path
         self._local = threading.local()
         self._write_lock = threading.RLock()
-        self.conn().executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        """Şemayı kurar ve eski (tek yönetici parolalı) veritabanlarını kullanıcı tablosuna taşır."""
+        c = self.conn()
+        columns = lambda table: {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+        if columns("sessions") and "user_id" not in columns("sessions"):
+            c.execute("DROP TABLE sessions")  # eski oturumlar kullanıcıya bağlı değil; yeniden giriş gerekir
+        c.executescript(SCHEMA)
+        if "acked_by" not in columns("alerts"):
+            c.execute("ALTER TABLE alerts ADD COLUMN acked_by TEXT")
+        legacy = c.execute("SELECT value FROM settings WHERE key='admin_hash'").fetchone()
+        if legacy:
+            if not c.execute("SELECT 1 FROM users").fetchone():
+                c.execute("INSERT INTO users(username,password_hash,role,all_companies,created_at) "
+                          "VALUES('admin',?,'admin',1,?)", (legacy[0], time.time()))
+            c.execute("DELETE FROM settings WHERE key='admin_hash'")
 
     def conn(self):
         c = getattr(self._local, "c", None)
@@ -156,6 +187,29 @@ class DB:
             return float(self.get(key))
         except ValueError:
             return float(DEFAULTS[key])
+
+    # --- kullanıcılar ---
+    def create_user(self, username, password, role, company_ids=None):
+        """company_ids None ise kullanıcı tüm şirketleri görür."""
+        with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO users(username,password_hash,role,all_companies,created_at) VALUES(?,?,?,?,?)",
+                (username, hash_password(password), role, 1 if company_ids is None else 0, time.time()))
+            for cid in company_ids or []:
+                c.execute("INSERT OR IGNORE INTO user_companies(user_id,company_id) VALUES(?,?)",
+                          (cur.lastrowid, cid))
+            return cur.lastrowid
+
+    def set_user_companies(self, user_id, company_ids):
+        with self.tx() as c:
+            c.execute("UPDATE users SET all_companies=? WHERE id=?", (1 if company_ids is None else 0, user_id))
+            c.execute("DELETE FROM user_companies WHERE user_id=?", (user_id,))
+            for cid in company_ids or []:
+                c.execute("INSERT OR IGNORE INTO user_companies(user_id,company_id) VALUES(?,?)", (user_id, cid))
+
+    def user_company_ids(self, user_id):
+        return [r["company_id"] for r in
+                self.q("SELECT company_id FROM user_companies WHERE user_id=? ORDER BY company_id", (user_id,))]
 
     # --- şirketler ---
     def create_company(self, code, name):

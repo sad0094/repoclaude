@@ -37,25 +37,29 @@ def main():
     ap.add_argument("--db", default=os.environ.get("NOBET_DB", "data/nobet.db"))
     ap.add_argument("--cert", help="TLS sertifikası (PEM)")
     ap.add_argument("--key", help="TLS özel anahtarı (PEM)")
-    ap.add_argument("--set-password", action="store_true", help="yönetici parolasını değiştir ve çık")
+    ap.add_argument("--set-password", action="store_true", help="bir kullanıcının parolasını değiştir ve çık")
+    ap.add_argument("--user", default="admin", help="--set-password için kullanıcı adı (varsayılan: admin)")
     args = ap.parse_args()
 
     db, notifier, engine, app = build(args.db)
 
     if args.set_password:
-        password = getpass.getpass("Yeni yönetici parolası: ")
+        user = db.one("SELECT id FROM users WHERE username=?", (args.user,))
+        if not user:
+            sys.exit(f"Kullanıcı bulunamadı: {args.user}")
+        password = getpass.getpass(f"{args.user} için yeni parola: ")
         if len(password) < 8:
             sys.exit("Parola en az 8 karakter olmalı.")
-        db.set("admin_hash", hash_password(password))
-        db.write("DELETE FROM sessions")
+        db.write("UPDATE users SET password_hash=?, active=1 WHERE id=?", (hash_password(password), user["id"]))
+        db.write("DELETE FROM sessions WHERE user_id=?", (user["id"],))
         print("Parola güncellendi.")
         return
 
-    if not db.get("admin_hash"):
+    if not db.one("SELECT 1 FROM users"):
         password = os.environ.get("NOBET_ADMIN_PASSWORD") or secrets.token_urlsafe(12)
-        db.set("admin_hash", hash_password(password))
+        db.create_user("admin", password, "admin")
         if not os.environ.get("NOBET_ADMIN_PASSWORD"):
-            print(f"İlk kurulum: yönetici parolası oluşturuldu -> {password}\n"
+            print(f"İlk kurulum: yönetici hesabı oluşturuldu -> kullanıcı: admin  parola: {password}\n"
                   "Bu parola bir daha gösterilmez; değiştirmek için --set-password kullanın.", flush=True)
 
     notifier.start()

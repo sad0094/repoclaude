@@ -30,12 +30,29 @@ Eşiklerin tamamı paneldeki **Ayarlar** sayfasından değiştirilir.
 python3 -m manager --port 8080 --db data/nobet.db
 ```
 
-İlk çalıştırmada yönetici parolası üretilip ekrana bir kez yazılır (`NOBET_ADMIN_PASSWORD` ortam
-değişkeniyle kendiniz de verebilirsiniz). Değiştirmek için:
+İlk çalıştırmada `admin` kullanıcısı oluşturulur ve parolası ekrana bir kez yazılır
+(`NOBET_ADMIN_PASSWORD` ortam değişkeniyle kendiniz de verebilirsiniz). Unutulan bir parolayı
+sunucudan sıfırlamak için:
 
 ```bash
-python3 -m manager --db data/nobet.db --set-password
+python3 -m manager --db data/nobet.db --set-password --user admin
 ```
+
+## Kullanıcılar ve roller
+
+Panelde **Kullanıcılar** sayfasından (yalnızca yönetici) hesap açılır; her hesaba bir rol ve
+erişebileceği şirketler atanır.
+
+| Rol | Görebildiği | Yapabildiği |
+| --- | --- | --- |
+| Yönetici | Tüm şirketler | Her şey: şirket ve ajan anahtarı, kullanıcılar, bildirim ve eşik ayarları |
+| Operatör | Atandığı şirketler (veya tümü) | Uyarı onaylama, cihazı izlemeye alma ve adlandırma |
+| İzleyici | Atandığı şirketler (veya tümü) | Yalnızca görüntüleme |
+
+Şirket kısıtı sunucu tarafında her sorguya uygulanır: kullanıcı, atanmadığı bir şirketin sunucusunu,
+cihazını, uyarısını veya bağlantı kaydını adresini bilse bile göremez. Uyarıyı kimin onayladığı kaydedilir.
+Herkes **Hesabım** sayfasından kendi parolasını değiştirebilir. Sistemde her zaman en az bir etkin yönetici kalır.
+Eski (tek parolalı) bir veritabanı ilk açılışta otomatik taşınır: mevcut parola `admin` kullanıcısının parolası olur.
 
 **TLS zorunlu sayılmalı:** ajan anahtarları ve panel oturumu bu bağlantıdan geçer. Ya `--cert`/`--key`
 verin ya da Manager'ı `--host 127.0.0.1` ile çalıştırıp önüne TLS sonlandıran bir ters vekil
@@ -112,6 +129,6 @@ python3 tools/demo.py http://127.0.0.1:8080 nbt_ANAHTAR
 - Bağlantı yakalama TCP içindir ve root gerektirir. Root yoksa ajan yalnızca kabul edilen
   bağlantıları görür; panel bunu sunucu sayfasında belirtir. UDP izlenmez.
 - Ağ keşfi ajanın bulunduğu alt ağla sınırlıdır (en fazla /22); yönlendirici arkasındaki ağlar görülmez.
-- Panelde tek yönetici hesabı vardır; şirket bazlı kullanıcı/rol ayrımı yok.
+- Kullanıcılar için iki adımlı doğrulama ve işlem (denetim) günlüğü yok; yalnızca uyarıyı kimin onayladığı tutulur.
 - Systemd servis dosyaları ve `install.sh` gerçek bir sunucuda henüz denenmedi.
 - Veriler SQLite'ta tutulur: ölçümler 7 gün, bağlantı kayıtları ve çözülen uyarılar 30 gün saklanır.

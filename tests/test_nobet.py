@@ -53,7 +53,7 @@ class ManagerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db, self.notifier, self.engine, self.app = build(os.path.join(self.tmp.name, "t.db"))
-        self.db.set("admin_hash", hash_password("gizli-parola"))
+        self.db.create_user("admin", "gizli-parola", "admin")
         FakeTelegram.received = []
         self.tg = HTTPServer(("127.0.0.1", 0), FakeTelegram)
         threading.Thread(target=self.tg.serve_forever, daemon=True).start()
@@ -65,7 +65,7 @@ class ManagerTest(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
         self.cookie = ""
-        self.cookie = self.call("/api/login", {"password": "gizli-parola"}, raw=True).headers["Set-Cookie"].split(";")[0]
+        self.cookie = self.login("admin", "gizli-parola")
         self.xxxx = self.call("/api/companies", {"code": "xxxx", "name": "XXXX LTD Şirketi"})
         self.yyy = self.call("/api/companies", {"code": "YYY", "name": "YYY LTD Şirketi"})
 
@@ -75,6 +75,18 @@ class ManagerTest(unittest.TestCase):
         self.tg.shutdown()
         self.tg.server_close()
         self.tmp.cleanup()
+
+    def login(self, username, password):
+        saved, self.cookie = self.cookie, ""
+        try:
+            resp = self.call("/api/login", {"username": username, "password": password}, raw=True)
+            return resp.headers["Set-Cookie"].split(";")[0]
+        finally:
+            self.cookie = saved
+
+    def as_user(self, username, password="parola-12345"):
+        """Sonraki çağrıları bu kullanıcının oturumuyla yapar."""
+        self.cookie = self.login(username, password)
 
     def call(self, path, body=None, token=None, raw=False):
         headers = {"Content-Type": "application/json"}
@@ -113,13 +125,14 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(self.status("/api/overview", cookie=False), 401)
         self.assertEqual(self.status("/api/companies", {"code": "ZZ", "name": "z"}, cookie=False), 401)
         self.assertEqual(self.status("/api/agent/report", report(), token="nbt_yanlis"), 401)
-        self.assertEqual(self.status("/api/login", {"password": "yanlis"}, cookie=False), 401)
+        self.assertEqual(self.status("/api/login", {"username": "admin", "password": "yanlis"}, cookie=False), 401)
+        self.assertEqual(self.status("/api/login", {"username": "yok", "password": "gizli-parola"}, cookie=False), 401)
         self.assertEqual(self.status("/api/overview"), 200)
 
     def test_login_is_rate_limited(self):
         for _ in range(5):
-            self.assertEqual(self.status("/api/login", {"password": "x"}, cookie=False), 401)
-        self.assertEqual(self.status("/api/login", {"password": "gizli-parola"}, cookie=False), 429)
+            self.assertEqual(self.status("/api/login", {"username": "admin", "password": "x"}, cookie=False), 401)
+        self.assertEqual(self.status("/api/login", {"username": "admin", "password": "gizli-parola"}, cookie=False), 429)
 
     def test_static_cannot_escape_directory(self):
         self.assertEqual(self.status("/static/..%2Fdb.py"), 404)
@@ -142,6 +155,127 @@ class ManagerTest(unittest.TestCase):
         new = self.call(f"/api/companies/{self.xxxx['id']}/token", {})["token"]
         self.assertEqual(self.status("/api/agent/report", report(), token=self.xxxx["token"]), 401)
         self.assertEqual(self.status("/api/agent/report", report(), token=new), 200)
+
+    # ---------------------------------------------------------------- kullanıcılar ve roller
+    def make_user(self, username, role, companies=None, all_companies=False):
+        body = {"username": username, "password": "parola-12345", "role": role,
+                "companies": [c["id"] for c in companies or []], "all_companies": all_companies}
+        return self.call("/api/users", body)["id"]
+
+    def seed_two_companies(self):
+        scan = [{"src": "203.0.113.9", "port": p, "count": 1, "open": False} for p in range(100, 120)]
+        dev = [{"ip": "10.0.0.1", "mac": "aa:aa:aa:aa:aa:01", "hostname": "gw"}]
+        self.call("/api/agent/report", report("xxxx-srv", disk=95, connections=scan, devices=dev), token=self.xxxx["token"])
+        self.call("/api/agent/report", report("yyy-srv", disk=95, devices=dev), token=self.yyy["token"])
+
+    def test_company_scoped_user_sees_only_assigned_company(self):
+        self.seed_two_companies()
+        hosts = {h["hostname"]: h["id"] for h in self.call("/api/hosts")["hosts"]}
+        self.make_user("xxxx.izleyici", "viewer", [self.xxxx])
+        self.as_user("xxxx.izleyici")
+        me = self.call("/api/me")
+        self.assertEqual((me["role"], me["companies"], me["all_companies"]), ("viewer", [self.xxxx["id"]], False))
+        self.assertEqual([c["code"] for c in self.call("/api/companies")["companies"]], ["XXXX"])
+        self.assertNotIn("token_hint", self.call("/api/companies")["companies"][0])
+        self.assertEqual([h["hostname"] for h in self.call("/api/hosts")["hosts"]], ["xxxx-srv"])
+        self.assertEqual({a["company_code"] for a in self.call("/api/alerts")["alerts"]}, {"XXXX"})
+        self.assertEqual({d["company_code"] for d in self.call("/api/devices")["devices"]}, {"XXXX"})
+        overview = self.call("/api/overview")
+        self.assertEqual((overview["kpis"]["hosts_total"], len(overview["companies"])), (1, 1))
+        self.assertEqual(self.call("/api/connections?hours=1")["totals"]["attempts"], 20)
+        # Başka şirketi açıkça istemek de veri döndürmez.
+        other = f"?company={self.yyy['id']}"
+        self.assertEqual(self.call("/api/hosts" + other)["hosts"], [])
+        self.assertEqual(self.call("/api/alerts" + other)["alerts"], [])
+        self.assertEqual(self.call("/api/connections" + other + "&hours=1")["totals"]["attempts"], 0)
+        self.assertEqual(self.status(f"/api/hosts/{hosts['yyy-srv']}"), 404)
+        self.assertEqual(self.status(f"/api/hosts/{hosts['xxxx-srv']}"), 200)
+
+    def test_viewer_is_read_only_and_operator_is_limited_to_own_company(self):
+        self.seed_two_companies()
+        alerts = {a["company_code"]: a["id"] for a in self.call("/api/alerts")["alerts"] if a["key"] == "disk:/"}
+        devices = {d["company_code"]: d["id"] for d in self.call("/api/devices")["devices"]}
+        self.make_user("izleyici", "viewer", all_companies=True)
+        self.make_user("yyy.operator", "operator", [self.yyy])
+
+        self.as_user("izleyici")
+        self.assertEqual(len(self.call("/api/hosts")["hosts"]), 2)
+        self.assertEqual(self.status(f"/api/alerts/{alerts['XXXX']}/ack", {}), 403)
+        self.assertEqual(self.status(f"/api/devices/{devices['XXXX']}", {"watched": True}), 403)
+
+        self.as_user("yyy.operator")
+        self.assertEqual(self.status(f"/api/alerts/{alerts['XXXX']}/ack", {}), 404)
+        self.assertEqual(self.status(f"/api/devices/{devices['XXXX']}", {"watched": True}), 404)
+        self.assertEqual(self.status(f"/api/alerts/{alerts['YYY']}/ack", {}), 200)
+        self.assertEqual(self.status(f"/api/devices/{devices['YYY']}", {"watched": True}), 200)
+        acked = [a for a in self.call("/api/alerts")["alerts"] if a["id"] == alerts["YYY"]][0]
+        self.assertEqual(acked["acked_by"], "yyy.operator")
+        self.assertIsNone(self.db.one("SELECT acked_at FROM alerts WHERE id=?", (alerts["XXXX"],))["acked_at"])
+        # Yönetim uç noktaları operatöre kapalı.
+        for path, body in (("/api/settings", None), ("/api/users", None), ("/api/settings", {"disk_crit": "1"}),
+                           ("/api/companies", {"code": "ZZ", "name": "z"}), ("/api/settings/test", {}),
+                           (f"/api/companies/{self.yyy['id']}/token", {}),
+                           ("/api/users", {"username": "yeni", "password": "parola-12345", "role": "admin"})):
+            self.assertEqual(self.status(path, body), 403, path)
+
+    def test_user_management_rules(self):
+        admin_id = self.call("/api/me")["id"]
+        uid = self.make_user("ayse", "operator", [self.xxxx])
+        self.assertEqual(self.status("/api/users", {"username": "ayse", "password": "parola-12345", "role": "viewer"}), 409)
+        self.assertEqual(self.status("/api/users", {"username": "A B", "password": "parola-12345", "role": "viewer"}), 400)
+        self.assertEqual(self.status("/api/users", {"username": "kisa", "password": "123", "role": "viewer"}), 400)
+        self.assertEqual(self.status("/api/users", {"username": "rol", "password": "parola-12345", "role": "root"}), 400)
+        self.assertEqual(self.status("/api/users", {"username": "sirket", "password": "parola-12345", "role": "viewer",
+                                                    "companies": [9999]}), 400)
+        # Son yönetici korunur; kendi hesabını silemez.
+        self.assertEqual(self.status(f"/api/users/{admin_id}", {"role": "viewer"}), 400)
+        self.assertEqual(self.status(f"/api/users/{admin_id}", {"active": False}), 400)
+        self.assertEqual(self.status(f"/api/users/{admin_id}/delete", {}), 400)
+        # Şirket ataması değişince erişim hemen değişir; devre dışı bırakınca oturum düşer.
+        self.call(f"/api/agent/report", report("yyy-srv"), token=self.yyy["token"])
+        admin_cookie = self.cookie
+        self.as_user("ayse")
+        ayse_cookie = self.cookie
+        self.assertEqual(self.call("/api/hosts")["hosts"], [])
+        self.cookie = admin_cookie
+        self.call(f"/api/users/{uid}", {"companies": [self.yyy["id"]]})
+        self.cookie = ayse_cookie
+        self.assertEqual(len(self.call("/api/hosts")["hosts"]), 1)
+        self.cookie = admin_cookie
+        self.call(f"/api/users/{uid}", {"active": False})
+        self.cookie = ayse_cookie
+        self.assertEqual(self.status("/api/hosts"), 401)
+        self.cookie = admin_cookie
+        self.assertEqual(self.status("/api/login", {"username": "ayse", "password": "parola-12345"}, cookie=False), 401)
+        self.call(f"/api/users/{uid}/delete", {})
+        self.assertEqual([u["username"] for u in self.call("/api/users")["users"]], ["admin"])
+
+    def test_change_own_password(self):
+        self.make_user("mehmet", "viewer", [self.xxxx])
+        self.as_user("mehmet")
+        self.assertEqual(self.status("/api/me/password", {"current": "yanlis", "password": "yeni-parola-1"}), 400)
+        self.assertEqual(self.status("/api/me/password", {"current": "parola-12345", "password": "kisa"}), 400)
+        self.call("/api/me/password", {"current": "parola-12345", "password": "yeni-parola-1"})
+        self.assertEqual(self.status("/api/me"), 200)   # mevcut oturum açık kalır
+        self.assertEqual(self.status("/api/login", {"username": "mehmet", "password": "parola-12345"}, cookie=False), 401)
+        self.assertEqual(self.status("/api/login", {"username": "mehmet", "password": "yeni-parola-1"}, cookie=False), 200)
+
+    def test_legacy_single_admin_database_is_migrated(self):
+        import sqlite3
+        from manager.db import DB
+        path = os.path.join(self.tmp.name, "eski.db")
+        old = sqlite3.connect(path)
+        old.executescript("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT);"
+                          "CREATE TABLE sessions(token_hash TEXT PRIMARY KEY, created_at REAL, expires_at REAL);")
+        old.execute("INSERT INTO settings VALUES('admin_hash', ?)", (hash_password("eski-parola"),))
+        old.commit()
+        old.close()
+        db = DB(path)
+        user = db.one("SELECT username, role, password_hash FROM users")
+        self.assertEqual((user["username"], user["role"]), ("admin", "admin"))
+        from manager.db import check_password
+        self.assertTrue(check_password("eski-parola", user["password_hash"]))
+        self.assertEqual(db.get("admin_hash"), "")
 
     # ---------------------------------------------------------------- uyarılar ve Telegram
     def test_critical_disk_alert_notifies_and_resolves(self):

@@ -23,7 +23,7 @@ Kritik uyarılar Telegram botuna/webhook'a gider ve onaylanana kadar tekrarlanı
 | `manager/db.py` | SQLite şeması, tek-yazar işlem kilidi, ayar varsayılanları, şirket/anahtar işlemleri |
 | `manager/core.py` | `Engine`: rapor işleme (`ingest`), uyarı kuralları, periyodik `tick` (çevrimdışı, tekrar bildirimi, temizlik) |
 | `manager/notify.py` | Telegram + webhook gönderimi (arka plan kuyruğu) |
-| `manager/web.py` | HTTP sunucusu, oturum, panel API'si, statik dosyalar |
+| `manager/web.py` | HTTP sunucusu, oturum, kullanıcı/rol yetkilendirmesi, panel API'si, statik dosyalar |
 | `manager/static/` | Tek sayfalık panel (bağımlılıksız JS; `h\`\`` şablonu her değeri kaçışlar) |
 | `agent/nobet_agent.py` | Linux ajanı (tek dosya): /proc ölçümleri, ARP keşfi, AF_PACKET ile SYN yakalama, auth.log/journald |
 | `agent/windows/nobet-agent.ps1` | Windows ajanı (PowerShell 5.1): CIM ölçümleri, komşu tablosu, Security olayları 5156/5157/5152 ve 4624/4625 |
@@ -36,7 +36,7 @@ Tasarım kaynağı (koyu tema, renkler, yerleşim): https://claude.ai/artifact/D
 ## Komutlar
 
 - Test: `python3 -m unittest discover -s tests`
-- Manager: `python3 -m manager --port 8080 --db data/nobet.db` (ilk çalıştırmada parola ekrana yazılır; `NOBET_ADMIN_PASSWORD` ile verilebilir)
+- Manager: `python3 -m manager --port 8080 --db data/nobet.db` (ilk çalıştırmada `admin` kullanıcısının parolası ekrana yazılır; `NOBET_ADMIN_PASSWORD` ile verilebilir; sıfırlama: `--set-password --user AD`)
 - Linux ajanı deneme: `sudo python3 agent/nobet_agent.py --manager URL --token nbt_... --print`
 
 ## Kurallar ve tuzaklar
@@ -46,14 +46,17 @@ Tasarım kaynağı (koyu tema, renkler, yerleşim): https://claude.ai/artifact/D
 - `.ps1` dosyaları **yalnızca ASCII** olmalı (PowerShell 5.1 BOM'suz dosyayı ANSI okur) ve PS 5.1 sözdizimiyle yazılmalı (`?:`, `??`, `&&` yok).
 - `conn_events.kind` değerleri `tcp | ssh_fail | ssh_ok`; son ikisi adı öyle kalsa da her türlü oturum açmayı (SSH, RDP, Windows ağ) taşır. Windows oturumlarında `port` NULL olabilir.
 - Rapor sözleşmesi: `POST /api/agent/report`, `Authorization: Bearer <şirket anahtarı>`; alanlar için `tests/test_nobet.py` içindeki `report()` ve `test_windows_agent_report_shape` örnek alınır. İki ajan da aynı sözleşmeyi kullanır.
+- Yetkilendirme: roller `admin | operator | viewer`. Panel sorgularının hepsi `App._scope(user, query, sütun)` üzerinden şirket kısıtı alır; yeni bir sorgu/uç nokta eklerken `user` parametresini geçirmeden veri döndürme. Tek kayıt üzerinde işlem yapan uç noktalar `owned(tablo, id)` ile kontrol edilir (yetkisizse 404). Yönetim uç noktaları `admin_only()` çağırır. Arayüzdeki gizleme (`canEdit()`, `isAdmin()`) yalnızca görünümdür; asıl kontrol sunucudadır.
+- Şema değişikliği gerekirse `DB._migrate` içine ekle (mevcut veritabanları yerinde yükseltilir).
 - Zaman damgası rapor Manager'a ulaştığında verilir; ajan saatine güvenilmez.
 - Commit iletilerine ve depoya model adı yazma. Kullanıcı açıkça istemedikçe PR açma.
 
-## Güncel durum (son güncelleme: 11.11.2026)
+## Güncel durum (son güncelleme: 12.11.2026)
 
 Çalışan ve doğrulanan:
-- Manager + Linux ajanı uçtan uca çalıştı; 20 test geçiyor; panel başsız tarayıcıda tüm sayfalarıyla denendi.
+- Manager + Linux ajanı uçtan uca çalıştı; 25 test geçiyor; panel başsız tarayıcıda tüm sayfalarıyla denendi.
 - Linux'ta SYN yakalama, loopback'e enjekte edilen çerçevelerle doğrulandı (port taraması uyarısı üretti).
+- Şirket bazlı kullanıcı/rol sistemi: testlerle (şirket yalıtımı, izleyici salt okunur, operatör yalnızca kendi şirketi, son yönetici koruması, parola değiştirme, eski veritabanı taşıma) ve tarayıcıda yönetici/operatör/izleyici oturumlarıyla doğrulandı.
 
 Yazıldı ama doğrulanmadı:
 - **Windows ajanı ve `install.ps1`/`uninstall.ps1` hiç çalıştırılmadı** (ortamda PowerShell yoktu; indirme izni reddedildi). Yalnızca gözle inceleme, ASCII ve ayraç dengesi kontrolü yapıldı. Belirsiz noktalar: 5156/5157/5152 olaylarında kaynak/hedef yönü (kod iki yönü de yerel adres karşılaştırmasıyla çözüyor), XPath filtresinin performansı, `ConvertTo-Json` dizi biçimi.
@@ -62,7 +65,7 @@ Yazıldı ama doğrulanmadı:
 
 Bilinen eksikler / sıradaki adaylar:
 1. Windows ajanını gerçek bir Windows Server'da `-Print` ile çalıştırıp hataları düzeltmek (en öncelikli).
-2. Şirket bazlı kullanıcı/rol (şu an tek yönetici hesabı).
-3. Sunucu servis/port sağlık kontrolleri (HTTP, TCP, sertifika süresi) — tasarımdaki "Servis durumu" bölümü henüz yok.
+2. Sunucu servis/port sağlık kontrolleri (HTTP, TCP, sertifika süresi) — tasarımdaki "Servis durumu" bölümü henüz yok.
+3. Kullanıcılar için iki adımlı doğrulama ve işlem (denetim) günlüğü; Telegram bildirimlerinin kullanıcı bazlı yönlendirilmesi.
 4. UDP izleme, yönlendirici arkasındaki alt ağların keşfi (SNMP), MAC üretici adı.
 5. Şirket silme ve veri dışa aktarma; raporlar sayfası.

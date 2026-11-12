@@ -10,7 +10,7 @@ function h(strings, ...vals) {
   return new Raw(out);
 }
 const app = document.getElementById('app');
-const ui = { company: localStorage.getItem('nobet.company') || '', companies: [], openCrit: 0,
+const ui = { me: null, company: localStorage.getItem('nobet.company') || '', companies: [], openCrit: 0,
   alertSev: 'all', alertState: 'open', devStatus: 'all', devQuery: '', hostIssues: false, hours: 24, newToken: null };
 let timer = null;
 
@@ -58,6 +58,9 @@ function fmtBps(n) {
   return `${n.toLocaleString('tr-TR', { maximumFractionDigits: n < 10 && i ? 1 : 0 })} ${units[i]}`;
 }
 const SEV = { crit: 'Kritik', warn: 'Uyarı', info: 'Bilgi' };
+const ROLE = { admin: 'Yönetici', operator: 'Operatör', viewer: 'İzleyici' };
+const canEdit = () => ui.me && ui.me.role !== 'viewer';
+const isAdmin = () => ui.me && ui.me.role === 'admin';
 const STATUS = { ok: 'Sağlıklı', warn: 'Uyarı', crit: 'Kritik', down: 'Çevrimdışı' };
 const PORTS = { 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS', 80: 'HTTP', 110: 'POP3', 135: 'RPC', 139: 'NetBIOS', 143: 'IMAP',
   443: 'HTTPS', 445: 'SMB', 587: 'SMTP', 993: 'IMAPS', 1433: 'MSSQL', 1521: 'Oracle', 3306: 'MySQL', 3389: 'RDP', 5432: 'PostgreSQL',
@@ -109,27 +112,28 @@ function barChart(buckets, parts, label) {
 }
 
 // ---------------------------------------------------------------- iskelet
-const NAV = [['', 'Genel Bakış'], ['hosts', 'Sunucular'], ['devices', 'Ağ Cihazları'], ['connections', 'Bağlantı Analizi'], ['alerts', 'Uyarılar'], ['settings', 'Ayarlar']];
+const NAV = [['', 'Genel Bakış'], ['hosts', 'Sunucular'], ['devices', 'Ağ Cihazları'], ['connections', 'Bağlantı Analizi'], ['alerts', 'Uyarılar'], ['users', 'Kullanıcılar', true], ['settings', 'Ayarlar', true], ['account', 'Hesabım']];
 function shell(route, content) {
-  const links = NAV.map(([id, label]) => h`<a class="nav ${route === id ? 'on' : ''}" href="#/${id}" ${route === id ? new Raw('aria-current="page"') : ''}><span>${label}</span>${id === 'alerts' && ui.openCrit ? h`<span class="count">${ui.openCrit}</span>` : ''}</a>`);
+  const links = NAV.filter(([, , adminOnly]) => !adminOnly || isAdmin()).map(([id, label]) => h`<a class="nav ${route === id ? 'on' : ''}" href="#/${id}" ${route === id ? new Raw('aria-current="page"') : ''}><span>${label}</span>${id === 'alerts' && ui.openCrit ? h`<span class="count">${ui.openCrit}</span>` : ''}</a>`);
   const options = ui.companies.map((c) => h`<option value="${c.id}" ${String(c.id) === ui.company ? new Raw('selected') : ''}>${c.code} — ${c.name}</option>`);
   return h`<div class="shell"><nav class="side" aria-label="Ana menü">
     <div class="brand"><svg aria-hidden="true" width="26" height="26" viewBox="0 0 26 26" fill="none" stroke="#5AA9FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13" cy="13" r="11"/><path d="M5 13h4l2-5 4 10 2-5h4"/></svg>Nöbet</div>
-    <label for="company">Şirket</label><select id="company"><option value="">Tüm şirketler</option>${options}</select>
-    ${links}<div class="spacer"></div><button type="button" class="btn" data-act="logout">Oturumu kapat</button></nav>
+    <label for="company">Şirket</label><select id="company"><option value="">${ui.me && ui.me.all_companies ? 'Tüm şirketler' : 'Yetkili şirketlerim'}</option>${options}</select>
+    ${links}<div class="spacer"></div><div class="small muted" style="padding:0 12px 8px">${ui.me ? h`${ui.me.username} · ${ROLE[ui.me.role]}` : ''}</div><button type="button" class="btn" data-act="logout">Oturumu kapat</button></nav>
     <main class="main" id="main">${content}</main></div>`;
 }
 function showLogin(error = '') {
-  clearTimeout(timer);
+  clearTimeout(timer); ui.me = null;
   app.innerHTML = h`<div class="login"><form class="card" id="login-form">
     <div class="brand" style="padding:0">Nöbet</div><p class="muted" style="margin:0">Merkezi yönetim paneline giriş yapın.</p>
-    <label class="field"><span>Yönetici parolası</span><input type="password" name="password" autocomplete="current-password" required autofocus></label>
+    <label class="field"><span>Kullanıcı adı</span><input type="text" name="username" autocomplete="username" autocapitalize="none" required autofocus></label>
+    <label class="field"><span>Parola</span><input type="password" name="password" autocomplete="current-password" required></label>
     <div class="error" role="alert">${error}</div><button class="btn primary">Giriş yap</button></form></div>`.s;
 }
 
 // ---------------------------------------------------------------- görünümler
 function hostsTable(hosts, now) {
-  if (!hosts.length) return empty('Henüz rapor gönderen sunucu yok. Ayarlar sayfasından şirket ekleyip ajanı kurun.');
+  if (!hosts.length) return empty(isAdmin() ? 'Henüz rapor gönderen sunucu yok. Ayarlar sayfasından şirket ekleyip ajanı kurun.' : 'Yetkili olduğunuz şirketlerde rapor gönderen sunucu yok.');
   const rows = hosts.map((x) => {
     const disk = x.disks.length ? Math.max(...x.disks.map((d) => d.pct)) : null;
     return h`<tr><td><a href="#/host/${x.id}"><b>${x.hostname}</b></a><div class="mono muted">${x.ip || '—'}</div></td>
@@ -143,7 +147,7 @@ function alertItems(alerts, now, withAck = true) {
   return h`<ul class="list">${alerts.map((a) => h`<li>${badge(a.severity, SEV[a.severity])}
     <div><div class="title">${a.title}</div><div class="small muted">${a.company_code ? h`${a.company_code} · ` : ''}${a.hostname ? h`<a href="#/host/${a.host_id}">${a.hostname}</a> · ` : ''}${fmtTime(a.started_at)} başladı · ${a.resolved_at ? `${fmtDur(a.resolved_at - a.started_at)} sürdü` : `${fmtDur(now - a.started_at)} sürüyor`}</div>
     ${a.detail ? h`<div class="small muted">${a.detail}</div>` : ''}</div>
-    ${!withAck || a.resolved_at ? '' : a.acked_at ? h`<span class="acked">Onaylandı</span>` : h`<button type="button" class="btn line" data-act="ack" data-value="${a.id}">Onayla</button>`}</li>`)}</ul>`;
+    ${!withAck || a.resolved_at ? '' : a.acked_at ? h`<span class="acked">Onaylandı${a.acked_by ? ` · ${a.acked_by}` : ''}</span>` : canEdit() ? h`<button type="button" class="btn line" data-act="ack" data-value="${a.id}">Onayla</button>` : h`<span class="muted small">Onay bekliyor</span>`}</li>`)}</ul>`;
 }
 
 const views = {
@@ -165,7 +169,7 @@ const views = {
       <div class="card kpi"><div class="label">Açık uyarı</div><div class="value">${k.alerts.crit + k.alerts.warn + k.alerts.info}</div><div class="note"><span class="t-crit">${k.alerts.crit} kritik</span> · <span class="t-warn">${k.alerts.warn} uyarı</span> · ${k.alerts.info} bilgi</div></div>
       <div class="card kpi"><div class="label">Bağlantı denemesi (24 sa)</div><div class="value">${nf.format(k.attempts_24h)}</div><div class="note">${nf.format(k.closed_24h)} tanesi kapalı porta</div></div>
     </section>
-    <section class="card"><h2>Şirketler</h2><div class="row" style="margin-top:14px;gap:12px">${tiles.length ? tiles : empty('Henüz şirket yok. Ayarlar sayfasından ekleyin.')}</div></section>
+    <section class="card"><h2>Şirketler</h2><div class="row" style="margin-top:14px;gap:12px">${tiles.length ? tiles : empty(isAdmin() ? 'Henüz şirket yok. Ayarlar sayfasından ekleyin.' : 'Size atanmış şirket yok. Yöneticinizden erişim isteyin.')}</div></section>
     <div class="row top"><section class="card grow2"><div class="wrap between"><h2>Ağ trafiği · son 24 saat</h2>
         <div class="legend"><span><i style="background:#5AA9FF"></i>Gelen</span><span><i style="background:#F2B84B"></i>Giden (kesikli)</span></div></div>
         ${lineChart([{ color: '#5AA9FF', points: pts('rx') }, { color: '#F2B84B', dash: '7 5', points: pts('tx') }], { fmt: fmtBps, label: 'Son 24 saatte gelen ve giden ağ trafiği' })}</section>
@@ -221,8 +225,8 @@ const views = {
       <td class="mono">${x.ip}</td><td><b>${x.label || x.hostname || '—'}</b>${x.is_gateway ? h` ${badge('info', 'Ağ geçidi')}` : ''}${x.label && x.hostname ? h`<div class="small muted">${x.hostname}</div>` : ''}</td>
       <td class="mono">${x.mac}</td><td>${x.company_code}<div class="small muted">${x.seen_by} gördü</div></td>
       <td class="small muted">${fmtTime(x.first_seen)}</td><td class="small muted">${ago(d.now, x.last_seen)}</td>
-      <td><div class="wrap"><button type="button" class="btn ${x.watched ? 'on' : ''}" aria-pressed="${!!x.watched}" data-act="watch" data-value="${x.id}" data-on="${x.watched ? 0 : 1}">${x.watched ? 'İzleniyor' : 'İzle'}</button>
-        <button type="button" class="btn" data-act="label" data-value="${x.id}" data-label="${x.label}">Adlandır</button></div></td></tr>`);
+      <td>${canEdit() ? h`<div class="wrap"><button type="button" class="btn ${x.watched ? 'on' : ''}" aria-pressed="${!!x.watched}" data-act="watch" data-value="${x.id}" data-on="${x.watched ? 0 : 1}">${x.watched ? 'İzleniyor' : 'İzle'}</button>
+        <button type="button" class="btn" data-act="label" data-value="${x.id}" data-label="${x.label}">Adlandır</button></div>` : x.watched ? badge('info', 'İzleniyor') : ''}</td></tr>`);
     return h`<header class="head"><div><h1>Ağ Cihazları</h1><p>Ajanların yerel ağda keşfettiği tüm cihazlar · ${list.length} / ${d.devices.length} gösteriliyor. "İzle" seçilen cihaz yanıt vermezse kritik uyarı üretilir.</p></div></header>
       <section class="card"><div class="wrap between"><label class="field" style="max-width:320px"><span class="sr">Cihaz ara</span><input type="search" id="dev-search" placeholder="IP, MAC veya ad ara" value="${ui.devQuery}"></label>
         <div class="wrap" role="group" aria-label="Durum filtresi">${pill('dev-status', 'all', ui.devStatus, 'Tümü')}${pill('dev-status', 'online', ui.devStatus, 'Çevrimiçi')}${pill('dev-status', 'offline', ui.devStatus, 'Çevrimdışı')}</div></div>
@@ -300,15 +304,50 @@ const views = {
       <div class="row">${num('offline_seconds', 'Sunucu çevrimdışı sayılma süresi (sn)')}${num('device_offline_seconds', 'İzlenen cihaz çevrimdışı süresi (sn)')}${num('scan_ports', 'Port taraması eşiği (10 dk içinde port)')}${num('brute_fails', 'Parola saldırısı eşiği (10 dk içinde hata)')}</div>
       <div class="wrap"><button class="btn primary">Ayarları kaydet</button><button type="button" class="btn" data-act="test-notify">Test bildirimi gönder</button></div></form>`;
   },
+
+  async users() {
+    const [u, c] = await Promise.all([api('/api/users'), api('/api/companies')]);
+    const roleOptions = (current) => Object.keys(ROLE).map((r) => h`<option value="${r}" ${r === current ? new Raw('selected') : ''}>${ROLE[r]}</option>`);
+    const companyBoxes = (x, prefix) => h`<label class="check"><input type="checkbox" name="all_companies" ${x.all_companies ? new Raw('checked') : ''}>Tüm şirketler</label>
+      ${c.companies.map((co) => h`<label class="check"><input type="checkbox" name="companies" value="${co.id}" ${x.companies.includes(co.id) ? new Raw('checked') : ''}>${co.code}</label>`)}`;
+    const cards = u.users.map((x) => h`<form class="card" data-form="user-edit" data-id="${x.id}" style="display:flex;flex-direction:column;gap:12px">
+      <div class="wrap between"><div class="wrap"><h2>${x.username}</h2>${badge(x.role === 'admin' ? 'warn' : 'info', ROLE[x.role])}${x.active ? '' : badge('down', 'Devre dışı')}${x.id === ui.me.id ? badge('ok', 'Siz') : ''}</div>
+        <span class="small muted">Son giriş: ${x.last_login ? fmtTime(x.last_login) : 'hiç'}</span></div>
+      <div class="row"><label class="field" style="flex:0 1 200px"><span>Rol</span><select name="role">${roleOptions(x.role)}</select></label>
+        <label class="field"><span>Yeni parola (değiştirmek için doldurun)</span><input type="password" name="password" autocomplete="new-password" minlength="8"></label></div>
+      <fieldset style="border:0;margin:0;padding:0"><legend class="small muted">Erişebileceği şirketler (yönetici her zaman tümünü görür)</legend><div class="wrap">${companyBoxes(x, x.id)}</div></fieldset>
+      <div class="wrap"><label class="check"><input type="checkbox" name="active" ${x.active ? new Raw('checked') : ''}>Hesap etkin</label>
+        <button class="btn primary">Kaydet</button>${x.id === ui.me.id ? '' : h`<button type="button" class="btn" data-act="user-delete" data-value="${x.id}" data-name="${x.username}">Sil</button>`}</div></form>`);
+    return h`<header class="head"><div><h1>Kullanıcılar</h1><p>Yönetici her şeyi yapar. Operatör atandığı şirketlerde uyarı onaylar ve cihaz izler. İzleyici atandığı şirketleri yalnızca görür.</p></div></header>
+    <form class="card" data-form="user-new" style="display:flex;flex-direction:column;gap:12px"><h2>Yeni kullanıcı</h2>
+      <div class="row"><label class="field"><span>Kullanıcı adı</span><input type="text" name="username" required minlength="3" maxlength="32" autocapitalize="none" autocomplete="off" placeholder="ornek.kullanici"></label>
+        <label class="field"><span>Parola (en az 8 karakter)</span><input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
+        <label class="field" style="flex:0 1 200px"><span>Rol</span><select name="role">${roleOptions('viewer')}</select></label></div>
+      <fieldset style="border:0;margin:0;padding:0"><legend class="small muted">Erişebileceği şirketler</legend><div class="wrap">${companyBoxes({ all_companies: false, companies: [] }, 'new')}</div></fieldset>
+      <div><button class="btn primary">Kullanıcı ekle</button></div></form>
+    ${cards}`;
+  },
+
+  async account() {
+    const names = ui.me.all_companies ? 'Tüm şirketler' : (ui.companies.map((c) => c.code).join(', ') || 'Atanmış şirket yok');
+    return h`<header class="head"><div><h1>Hesabım</h1><p>${ui.me.username} · ${ROLE[ui.me.role]} · ${names}</p></div></header>
+    <form class="card" data-form="password" style="display:flex;flex-direction:column;gap:16px;max-width:520px"><h2>Parola değiştir</h2>
+      <label class="field"><span>Mevcut parola</span><input type="password" name="current" required autocomplete="current-password"></label>
+      <label class="field"><span>Yeni parola (en az 8 karakter)</span><input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
+      <p class="small muted" style="margin:0">Parolayı değiştirince diğer cihazlardaki oturumlarınız kapanır.</p>
+      <div><button class="btn primary">Parolayı değiştir</button></div></form>`;
+  },
 };
+const ADMIN_VIEWS = ['settings', 'users'], STATIC_VIEWS = ['settings', 'users', 'account'];
 
 // ---------------------------------------------------------------- yönlendirme ve olaylar
-function route() { const [, name = '', arg] = location.hash.split('/'); return { name: views[name] ? name : '', arg }; }
+function route() { const [, name = '', arg] = location.hash.split('/'); return { name: views[name] && (!ADMIN_VIEWS.includes(name) || isAdmin()) ? name : '', arg }; }
 async function render(auto = false) {
   clearTimeout(timer);
+  if (!ui.me) { try { ui.me = await api('/api/me'); } catch (err) { return; } }
   const r = route();
   // Kullanıcı bir alana yazarken otomatik yenileme içeriği ezmesin.
-  if (auto && (r.name === 'settings' || (document.activeElement && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)))) { timer = setTimeout(() => render(true), 15000); return; }
+  if (auto && (STATIC_VIEWS.includes(r.name) || (document.activeElement && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)))) { timer = setTimeout(() => render(true), 15000); return; }
   try {
     if (!ui.companies.length) ui.companies = (await api('/api/companies')).companies;
     if (ui.company && !ui.companies.some((c) => String(c.id) === ui.company)) ui.company = '';
@@ -339,6 +378,7 @@ const actions = {
     if (!confirm(`${el.dataset.code} için yeni anahtar üretilsin mi? Eski anahtarı kullanan ajanlar rapor gönderemez.`)) return;
     ui.newToken = { code: el.dataset.code, token: (await api(`/api/companies/${v}/token`, {})).token };
   },
+  'user-delete': async (v, el) => { if (!confirm(`${el.dataset.name} kullanıcısı silinsin mi?`)) return false; await api(`/api/users/${v}/delete`, {}); },
   'test-notify': async () => { const r = await api('/api/settings/test', {}); toast(`Test bildirimi gönderildi: ${r.sent.join(', ')}`); return false; },
 };
 document.addEventListener('click', async (ev) => {
@@ -351,7 +391,16 @@ document.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const form = ev.target, data = Object.fromEntries(new FormData(form));
   try {
-    if (form.id === 'login-form') { await api('/api/login', data); ui.companies = []; return render(); }
+    if (form.id === 'login-form') { await api('/api/login', data); ui.companies = []; ui.me = null; return render(); }
+    if (form.dataset.form === 'user-new' || form.dataset.form === 'user-edit') {
+      const fd = new FormData(form);
+      const body = { role: data.role, all_companies: !!form.all_companies.checked, companies: fd.getAll('companies').map(Number) };
+      if (data.password) body.password = data.password;
+      if (form.dataset.form === 'user-new') { body.username = data.username; await api('/api/users', body); toast('Kullanıcı eklendi.'); }
+      else { body.active = form.active.checked; await api(`/api/users/${form.dataset.id}`, body); toast('Kullanıcı güncellendi.'); }
+      if (form.dataset.id === String(ui.me.id)) ui.me = null;
+    }
+    if (form.dataset.form === 'password') { await api('/api/me/password', data); toast('Parola değiştirildi.'); }
     if (form.dataset.form === 'company-new') { ui.newToken = await api('/api/companies', data); }
     if (form.dataset.form === 'company-chat') { await api(`/api/companies/${form.dataset.id}`, data); toast('Kaydedildi.'); }
     if (form.dataset.form === 'settings') { data.notify_warn = form.notify_warn.checked ? 1 : 0; await api('/api/settings', data); toast('Ayarlar kaydedildi.'); }
