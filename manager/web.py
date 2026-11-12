@@ -10,6 +10,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from . import totp
 from .db import DEFAULTS, NUMERIC, check_password, hash_password, sha256
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -39,9 +40,9 @@ def is_internal(ip):
 
 
 class HttpError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, extra=None):
         super().__init__(message)
-        self.status, self.message = status, message
+        self.status, self.message, self.extra = status, message, extra or {}
 
 
 class App:
@@ -51,34 +52,115 @@ class App:
         self._fails_lock = threading.Lock()
 
     # ------------------------------------------------------------------ oturum
-    def login(self, username, password, client):
+    def login(self, username, password, code, client):
+        """Parolayı, etkinse ikinci adımı doğrular. (oturum anahtarı, kurtarma kodu kullanıldı mı) döndürür."""
         now = time.time()
+        username = username.strip().lower()
+        keys = (client, "u:" + username)     # hem adres hem hesap başına deneme sınırı
         with self._fails_lock:
-            recent = [t for t in self._fails.get(client, []) if t > now - 60]
-            if len(recent) >= 5:
+            if len(self._fails) > 5000:   # sayaç tablosu sınırsız büyümesin
+                self._fails = {k: v for k, v in self._fails.items() if v and v[-1] > now - 60}
+            recent = {k: [t for t in self._fails.get(k, []) if t > now - 60] for k in keys}
+            if any(len(v) >= 5 for v in recent.values()):
                 raise HttpError(429, "Çok fazla hatalı deneme. Bir dakika sonra tekrar deneyin.")
-            user = self.db.one("SELECT * FROM users WHERE username=? AND active=1", (username.strip().lower(),))
+
+            def fail(message, **extra):
+                for k in keys:
+                    self._fails[k] = recent[k] + [now]
+                return HttpError(401, message, extra)
+
+            user = self.db.one("SELECT * FROM users WHERE username=? AND active=1", (username,))
             if not check_password(password, user["password_hash"] if user else DUMMY_HASH) or not user:
-                self._fails[client] = recent + [now]
-                raise HttpError(401, "Kullanıcı adı veya parola hatalı.")
-            self._fails.pop(client, None)
+                raise fail("Kullanıcı adı veya parola hatalı.")
+            used_recovery = False
+            if user["totp_enabled"]:
+                if not str(code or "").strip():
+                    # Parola doğru, ikinci adım bekleniyor: hata sayılmaz, oturum açılmaz.
+                    raise HttpError(401, "Doğrulama kodunu girin.", {"totp_required": True})
+                step = totp.verify(user["totp_secret"], code, user["totp_last_step"])
+                if step:
+                    self.db.write("UPDATE users SET totp_last_step=? WHERE id=?", (step, user["id"]))
+                elif self._use_recovery_code(user["id"], code):
+                    used_recovery = True
+                else:
+                    raise fail("Doğrulama kodu hatalı.", totp_required=True, totp_failed=True)
+            for k in keys:
+                self._fails.pop(k, None)
         token = secrets.token_urlsafe(32)
         with self.db.tx() as c:
             c.execute("INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",
                       (sha256(token), user["id"], now, now + SESSION_TTL))
             c.execute("UPDATE users SET last_login=? WHERE id=?", (now, user["id"]))
-        return token
+        return token, used_recovery
+
+    # ------------------------------------------------------------------ iki adımlı doğrulama
+    def _use_recovery_code(self, user_id, code):
+        normalized = totp.normalize_recovery(code)
+        if not normalized:
+            return False
+        with self.db.tx() as c:
+            cur = c.execute("UPDATE recovery_codes SET used_at=? WHERE user_id=? AND code_hash=? AND used_at IS NULL",
+                            (time.time(), user_id, sha256(normalized)))
+            return cur.rowcount == 1
+
+    def _require_password(self, user, body):
+        row = self.db.one("SELECT password_hash FROM users WHERE id=?", (user["id"],))
+        if not check_password(str(body.get("password", "")), row["password_hash"]):
+            raise HttpError(400, "Parola hatalı.")
+
+    def totp_setup(self, user, body):
+        """Yeni bir gizli anahtar üretir; kod doğrulanana kadar iki adımlı doğrulama etkinleşmez."""
+        self._require_password(user, body)
+        if user["totp_enabled"]:
+            raise HttpError(400, "İki adımlı doğrulama zaten etkin.")
+        secret = totp.new_secret()
+        self.db.write("UPDATE users SET totp_secret=?, totp_last_step=0 WHERE id=?", (secret, user["id"]))
+        return {"secret": secret, "uri": totp.provisioning_uri(secret, user["username"])}
+
+    def totp_enable(self, user, body, keep_token):
+        row = self.db.one("SELECT totp_secret, totp_enabled FROM users WHERE id=?", (user["id"],))
+        if row["totp_enabled"] or not row["totp_secret"]:
+            raise HttpError(400, "Önce kurulumu başlatın.")
+        step = totp.verify(row["totp_secret"], body.get("code", ""))
+        if not step:
+            raise HttpError(400, "Kod hatalı. Uygulamadaki güncel 6 haneli kodu girin.")
+        codes = totp.new_recovery_codes()
+        with self.db.tx() as c:
+            c.execute("UPDATE users SET totp_enabled=1, totp_last_step=? WHERE id=?", (step, user["id"]))
+            c.execute("DELETE FROM recovery_codes WHERE user_id=?", (user["id"],))
+            for code in codes:
+                c.execute("INSERT INTO recovery_codes(user_id,code_hash) VALUES(?,?)", (user["id"], sha256(code)))
+            c.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (user["id"], sha256(keep_token)))
+        return {"ok": True, "recovery_codes": codes}
+
+    def totp_disable(self, user, body):
+        self._require_password(user, body)
+        row = self.db.one("SELECT totp_secret, totp_enabled, totp_last_step FROM users WHERE id=?", (user["id"],))
+        if not row["totp_enabled"]:
+            raise HttpError(400, "İki adımlı doğrulama etkin değil.")
+        step = totp.verify(row["totp_secret"], body.get("code", ""), row["totp_last_step"])
+        if not step and not self._use_recovery_code(user["id"], body.get("code", "")):
+            raise HttpError(400, "Doğrulama kodu hatalı.")
+        self.reset_totp(user["id"])
+        return {"ok": True}
+
+    def reset_totp(self, user_id):
+        with self.db.tx() as c:
+            c.execute("UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_last_step=0 WHERE id=?", (user_id,))
+            c.execute("DELETE FROM recovery_codes WHERE user_id=?", (user_id,))
 
     def session_user(self, token):
         """Geçerli oturumun kullanıcısı; `companies` None ise tüm şirketlere erişir."""
         if not token:
             return None
         user = self.db.one(
-            "SELECT u.id, u.username, u.role, u.all_companies FROM sessions s JOIN users u ON u.id=s.user_id "
+            "SELECT u.id, u.username, u.role, u.all_companies, u.totp_enabled FROM sessions s JOIN users u ON u.id=s.user_id "
             "WHERE s.token_hash=? AND s.expires_at>? AND u.active=1", (sha256(token), time.time()))
         if user:
             everything = user["role"] == "admin" or user["all_companies"]
             user["companies"] = None if everything else set(self.db.user_company_ids(user["id"]))
+            # Zorunlu tutulmuşsa, kurulumu yapmamış kullanıcı yalnızca kendi hesap sayfasına erişebilir.
+            user["must_setup_2fa"] = bool(self.db.num("require_2fa") >= 1 and not user["totp_enabled"])
         return user
 
     @staticmethod
@@ -118,7 +200,7 @@ class App:
 
     # ------------------------------------------------------------------ kullanıcı yönetimi
     def users(self):
-        rows = self.db.q("SELECT id, username, role, all_companies, active, created_at, last_login "
+        rows = self.db.q("SELECT id, username, role, all_companies, active, created_at, last_login, totp_enabled "
                          "FROM users ORDER BY username")
         for r in rows:
             r["companies"] = self.db.user_company_ids(r["id"])
@@ -189,6 +271,10 @@ class App:
             changes.append(f"şirketler: {self._company_codes(before)} -> {self._company_codes(after)}")
         if body.get("password"):
             changes.append("parola sıfırlandı")
+        if body.get("reset_totp") and target["totp_enabled"]:
+            self.reset_totp(user_id)
+            self.db.write("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            changes.append("iki adımlı doğrulama sıfırlandı")
         return {"ok": True, "username": target["username"], "changes": changes}
 
     def _company_codes(self, ids):
@@ -692,7 +778,7 @@ def make_handler(app):
                     return self._static(path)
                 self._api(method, path, query)
             except HttpError as err:
-                self._send(err.status, {"error": err.message})
+                self._send(err.status, {"error": err.message, **err.extra})
             except ValueError as err:
                 self._send(400, {"error": str(err)})
             except Exception as err:  # beklenmeyen hata: ayrıntıyı istemciye sızdırma
@@ -714,12 +800,16 @@ def make_handler(app):
                 body = self._body()
                 name, ip = str(body.get("username", "")).strip().lower(), self._client_ip()
                 try:
-                    token = app.login(name, str(body.get("password", "")), ip)
+                    token, used_recovery = app.login(name, str(body.get("password", "")), body.get("code"), ip)
                 except HttpError as err:
-                    if err.status == 401:
+                    if err.extra.get("totp_failed"):
+                        app.audit({"username": name or "-"}, "auth.login_failed", detail="doğrulama kodu hatalı", ip=ip)
+                    elif err.status == 401 and not err.extra.get("totp_required"):
                         app.audit({"username": name or "-"}, "auth.login_failed", ip=ip)
                     raise
-                app.audit(app.session_user(token), "auth.login", ip=ip)
+                who = app.session_user(token)
+                app.audit(who, "auth.login", detail="kurtarma kodu kullanıldı" if used_recovery else
+                          "iki adımlı" if who["totp_enabled"] else "", ip=ip)
                 return self._send(200, {"ok": True}, headers=[self._cookie(token, SESSION_TTL)])
             if (method, path) == ("POST", "/api/logout"):
                 token = self._session_token()
@@ -751,11 +841,19 @@ def make_handler(app):
             def log(action, target="", detail="", company_id=None):
                 app.audit(user, action, target, detail, company_id, self._client_ip())
 
+            if user["must_setup_2fa"] and resource != "me":
+                raise HttpError(403, "Devam etmek için iki adımlı doğrulamayı kurmanız gerekiyor.",
+                                {"setup_2fa": True})
+
             if method == "GET":
                 if resource == "me":
+                    left = app.db.one("SELECT COUNT(*) n FROM recovery_codes WHERE user_id=? AND used_at IS NULL",
+                                      (user["id"],))["n"]
                     return self._send(200, {"id": user["id"], "username": user["username"], "role": user["role"],
                                             "all_companies": user["companies"] is None,
-                                            "companies": sorted(user["companies"] or [])})
+                                            "companies": sorted(user["companies"] or []),
+                                            "totp_enabled": bool(user["totp_enabled"]), "recovery_codes_left": left,
+                                            "must_setup_2fa": user["must_setup_2fa"]})
                 if resource == "overview":
                     return self._send(200, app.overview(user, query))
                 if resource == "hosts" and rid:
@@ -791,6 +889,16 @@ def make_handler(app):
             if method != "POST":
                 raise HttpError(405, "Desteklenmeyen yöntem.")
             body = self._body()
+            if resource == "me" and action in ("totp_setup", "totp_enable", "totp_disable"):
+                if action == "totp_setup":
+                    return self._send(200, app.totp_setup(user, body))
+                if action == "totp_enable":
+                    result = app.totp_enable(user, body, self._session_token())
+                    log("auth.totp_enabled")
+                    return self._send(200, result)
+                result = app.totp_disable(user, body)
+                log("auth.totp_disabled")
+                return self._send(200, result)
             if resource == "me" and action == "password":
                 result = app.change_own_password(user, body, self._session_token())
                 log("auth.password")

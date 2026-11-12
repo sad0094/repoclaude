@@ -10,7 +10,7 @@ function h(strings, ...vals) {
   return new Raw(out);
 }
 const app = document.getElementById('app');
-const ui = { me: null, company: localStorage.getItem('nobet.company') || '', companies: [], openCrit: 0,
+const ui = { me: null, totpSetup: null, recovery: null, company: localStorage.getItem('nobet.company') || '', companies: [], openCrit: 0,
   dlpHours: 24, auditArea: '', auditQuery: '', auditPages: [], alertSev: 'all', alertState: 'open', devStatus: 'all', devQuery: '', hostIssues: false, hours: 24, newToken: null };
 let timer = null;
 
@@ -19,7 +19,8 @@ async function api(path, body) {
   const res = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && path !== '/api/login') { showLogin(); throw new Error('Oturum gerekli.'); }
-  if (!res.ok) throw new Error(data.error || 'İstek başarısız.');
+  if (res.status === 403 && data.setup_2fa && ui.me && !ui.me.must_setup_2fa) { ui.me = null; setTimeout(render, 0); }
+  if (!res.ok) { const err = new Error(data.error || 'İstek başarısız.'); err.data = data; throw err; }
   return data;
 }
 const scoped = (path, extra = {}) => {
@@ -61,7 +62,7 @@ const SEV = { crit: 'Kritik', warn: 'Uyarı', info: 'Bilgi' };
 const ROLE = { admin: 'Yönetici', operator: 'Operatör', viewer: 'İzleyici' };
 const canEdit = () => ui.me && ui.me.role !== 'viewer';
 const isAdmin = () => ui.me && ui.me.role === 'admin';
-const AUDIT = { 'auth.login': ['Giriş', 'ok'], 'auth.login_failed': ['Başarısız giriş', 'down'], 'auth.logout': ['Çıkış', 'info'], 'auth.password': ['Parola değişikliği', 'warn'],
+const AUDIT = { 'auth.login': ['Giriş', 'ok'], 'auth.login_failed': ['Başarısız giriş', 'down'], 'auth.logout': ['Çıkış', 'info'], 'auth.password': ['Parola değişikliği', 'warn'], 'auth.totp_enabled': ['İki adım açıldı', 'ok'], 'auth.totp_disabled': ['İki adım kapatıldı', 'warn'],
   'alert.ack': ['Uyarı onayı', 'info'], 'device.watch': ['Cihaz izleme', 'info'], 'device.label': ['Cihaz adlandırma', 'info'],
   'check.create': ['Kontrol eklendi', 'info'], 'check.update': ['Kontrol değişti', 'info'], 'check.delete': ['Kontrol silindi', 'warn'],
   'user.create': ['Kullanıcı eklendi', 'warn'], 'user.update': ['Kullanıcı değişti', 'warn'], 'user.delete': ['Kullanıcı silindi', 'warn'],
@@ -138,8 +139,16 @@ function shell(route, content) {
     ${links}<div class="spacer"></div><div class="small muted" style="padding:0 12px 8px">${ui.me ? h`${ui.me.username} · ${ROLE[ui.me.role]}` : ''}</div><button type="button" class="btn" data-act="logout">Oturumu kapat</button></nav>
     <main class="main" id="main">${content}</main></div>`;
 }
-function showLogin(error = '') {
+function showLogin(error = '', pending = null) {
   clearTimeout(timer); ui.me = null;
+  if (pending) {   // parola doğru, ikinci adım bekleniyor
+    app.innerHTML = h`<div class="login"><form class="card" id="login-form">
+      <div class="brand" style="padding:0">Nöbet</div><p class="muted" style="margin:0">Kimlik doğrulama uygulamanızdaki 6 haneli kodu girin. Telefonunuz yanınızda değilse kurtarma kodlarınızdan birini kullanın.</p>
+      <input type="hidden" name="username" value="${pending.username}"><input type="hidden" name="password" value="${pending.password}">
+      <label class="field"><span>Doğrulama kodu</span><input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus maxlength="12"></label>
+      <div class="error" role="alert">${error}</div><button class="btn primary">Doğrula</button><a href="#/" data-act="login-back" class="small">Farklı hesapla giriş yap</a></form></div>`.s;
+    return;
+  }
   app.innerHTML = h`<div class="login"><form class="card" id="login-form">
     <div class="brand" style="padding:0">Nöbet</div><p class="muted" style="margin:0">Merkezi yönetim paneline giriş yapın.</p>
     <label class="field"><span>Kullanıcı adı</span><input type="text" name="username" autocomplete="username" autocapitalize="none" required autofocus></label>
@@ -319,6 +328,8 @@ const views = {
         <label class="field"><span>Panel adresi (bildirimlere bağlantı eklenir)</span><input type="text" name="panel_url" value="${s.panel_url}" placeholder="https://panel.example.com"></label></div>
       <div class="row">${num('reminder_minutes', 'Onaylanmayan kritik uyarıyı tekrarla (dakika, 0 = kapalı)')}
         <label class="check" style="flex:1 1 200px"><input type="checkbox" name="notify_warn" ${s.notify_warn >= 1 ? new Raw('checked') : ''}>"Uyarı" seviyesini de bildir</label></div>
+      <h2>Oturum güvenliği</h2>
+      <label class="check"><input type="checkbox" name="require_2fa" ${s.require_2fa >= 1 ? new Raw('checked') : ''}>Tüm kullanıcılar için iki adımlı doğrulamayı zorunlu tut (kurmayanlar kurana kadar paneli kullanamaz)</label>
       <h2>Uyarı eşikleri</h2>
       <div class="row">${num('disk_warn', 'Disk uyarı (%)')}${num('disk_crit', 'Disk kritik (%)')}${num('cpu_warn', 'CPU uyarı (%)')}${num('mem_warn', 'Bellek uyarı (%)')}</div>
       <div class="row">${num('offline_seconds', 'Sunucu çevrimdışı sayılma süresi (sn)')}${num('device_offline_seconds', 'İzlenen cihaz çevrimdışı süresi (sn)')}${num('scan_ports', 'Port taraması eşiği (10 dk içinde port)')}${num('brute_fails', 'Parola saldırısı eşiği (10 dk içinde hata)')}</div>
@@ -419,13 +430,13 @@ const views = {
     const companyBoxes = (x, prefix) => h`<label class="check"><input type="checkbox" name="all_companies" ${x.all_companies ? new Raw('checked') : ''}>Tüm şirketler</label>
       ${c.companies.map((co) => h`<label class="check"><input type="checkbox" name="companies" value="${co.id}" ${x.companies.includes(co.id) ? new Raw('checked') : ''}>${co.code}</label>`)}`;
     const cards = u.users.map((x) => h`<form class="card" data-form="user-edit" data-id="${x.id}" style="display:flex;flex-direction:column;gap:12px">
-      <div class="wrap between"><div class="wrap"><h2>${x.username}</h2>${badge(x.role === 'admin' ? 'warn' : 'info', ROLE[x.role])}${x.active ? '' : badge('down', 'Devre dışı')}${x.id === ui.me.id ? badge('ok', 'Siz') : ''}</div>
+      <div class="wrap between"><div class="wrap"><h2>${x.username}</h2>${badge(x.role === 'admin' ? 'warn' : 'info', ROLE[x.role])}${x.totp_enabled ? badge('ok', 'İki adımlı') : ''}${x.active ? '' : badge('down', 'Devre dışı')}${x.id === ui.me.id ? badge('ok', 'Siz') : ''}</div>
         <span class="small muted">Son giriş: ${x.last_login ? fmtTime(x.last_login) : 'hiç'}</span></div>
       <div class="row"><label class="field" style="flex:0 1 200px"><span>Rol</span><select name="role">${roleOptions(x.role)}</select></label>
         <label class="field"><span>Yeni parola (değiştirmek için doldurun)</span><input type="password" name="password" autocomplete="new-password" minlength="8"></label></div>
       <fieldset style="border:0;margin:0;padding:0"><legend class="small muted">Erişebileceği şirketler (yönetici her zaman tümünü görür)</legend><div class="wrap">${companyBoxes(x, x.id)}</div></fieldset>
       <div class="wrap"><label class="check"><input type="checkbox" name="active" ${x.active ? new Raw('checked') : ''}>Hesap etkin</label>
-        <button class="btn primary">Kaydet</button>${x.id === ui.me.id ? '' : h`<button type="button" class="btn" data-act="user-delete" data-value="${x.id}" data-name="${x.username}">Sil</button>`}</div></form>`);
+        <button class="btn primary">Kaydet</button>${x.totp_enabled && x.id !== ui.me.id ? h`<button type="button" class="btn" data-act="user-reset-totp" data-value="${x.id}" data-name="${x.username}">İki adımı sıfırla</button>` : ''}${x.id === ui.me.id ? '' : h`<button type="button" class="btn" data-act="user-delete" data-value="${x.id}" data-name="${x.username}">Sil</button>`}</div></form>`);
     return h`<header class="head"><div><h1>Kullanıcılar</h1><p>Yönetici her şeyi yapar. Operatör atandığı şirketlerde uyarı onaylar ve cihaz izler. İzleyici atandığı şirketleri yalnızca görür.</p></div></header>
     <form class="card" data-form="user-new" style="display:flex;flex-direction:column;gap:12px"><h2>Yeni kullanıcı</h2>
       <div class="row"><label class="field"><span>Kullanıcı adı</span><input type="text" name="username" required minlength="3" maxlength="32" autocapitalize="none" autocomplete="off" placeholder="ornek.kullanici"></label>
@@ -443,13 +454,44 @@ const views = {
       <label class="field"><span>Mevcut parola</span><input type="password" name="current" required autocomplete="current-password"></label>
       <label class="field"><span>Yeni parola (en az 8 karakter)</span><input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
       <p class="small muted" style="margin:0">Parolayı değiştirince diğer cihazlardaki oturumlarınız kapanır.</p>
-      <div><button class="btn primary">Parolayı değiştir</button></div></form>`;
+      <div><button class="btn primary">Parolayı değiştir</button></div></form>
+    ${twoFactorCard()}`;
   },
 };
+function twoFactorCard() {
+  const me = ui.me, open = 'class="card" style="display:flex;flex-direction:column;gap:16px;max-width:520px"';
+  if (ui.recovery) {
+    return h`<section ${new Raw(open)}><h2>Kurtarma kodlarınız</h2><p class="muted" style="margin:0">İki adımlı doğrulama etkin. Telefonunuza erişemezseniz bu kodlarla giriş yapabilirsiniz; her kod bir kez kullanılır. <b>Bu kodlar bir daha gösterilmez</b>, güvenli bir yere kaydedin.</p>
+      <div class="notice"><code>${ui.recovery.join('   ')}</code></div><div><button type="button" class="btn primary" data-act="recovery-done">Kaydettim</button></div></section>`;
+  }
+  if (me.totp_enabled) {
+    return h`<form ${new Raw(open)} data-form="totp-disable"><div class="wrap"><h2>İki adımlı doğrulama</h2>${badge('ok', 'Etkin')}</div>
+      <p class="muted" style="margin:0">Girişte paroladan sonra uygulama kodu istenir. Kullanılmamış kurtarma kodu: ${me.recovery_codes_left}.</p>
+      <label class="field"><span>Parola</span><input type="password" name="password" required autocomplete="current-password"></label>
+      <label class="field"><span>Uygulama kodu veya kurtarma kodu</span><input type="text" name="code" required autocomplete="one-time-code" maxlength="12"></label>
+      <div><button class="btn">İki adımlı doğrulamayı kapat</button></div></form>`;
+  }
+  if (ui.totpSetup) {
+    const grouped = ui.totpSetup.secret.replace(/(.{4})/g, '$1 ').trim();
+    return h`<form ${new Raw(open)} data-form="totp-enable"><h2>İki adımlı doğrulama · kurulum</h2>
+      <ol class="muted" style="margin:0;padding-left:20px"><li>Telefonunuzda bir kimlik doğrulama uygulaması açın (Google Authenticator, Microsoft Authenticator, Authy).</li>
+        <li>"Kurulum anahtarı gir" seçeneğiyle aşağıdaki anahtarı ekleyin (tür: zaman tabanlı).</li><li>Uygulamanın gösterdiği 6 haneli kodu yazın.</li></ol>
+      <div class="notice"><div class="small muted">Hesap: Nobet:${me.username}</div><code style="font-size:16px">${grouped}</code>
+        <div class="small" style="margin-top:8px"><a href="${ui.totpSetup.uri}">Bu cihazdaki uygulamada aç</a></div></div>
+      <label class="field"><span>6 haneli kod</span><input type="text" name="code" inputmode="numeric" required autocomplete="one-time-code" maxlength="7"></label>
+      <div class="wrap"><button class="btn primary">Etkinleştir</button><button type="button" class="btn" data-act="totp-cancel">Vazgeç</button></div></form>`;
+  }
+  return h`<form ${new Raw(open)} data-form="totp-setup"><div class="wrap"><h2>İki adımlı doğrulama</h2>${badge(me.must_setup_2fa ? 'down' : 'off', me.must_setup_2fa ? 'Zorunlu' : 'Kapalı')}</div>
+    <p class="muted" style="margin:0">${me.must_setup_2fa ? 'Yöneticiniz iki adımlı doğrulamayı zorunlu tuttu. Panelin geri kalanını kullanabilmek için kurulumu tamamlayın.' : 'Parolanız ele geçirilse bile hesabınıza girilememesi için telefonunuzdaki bir uygulamadan kod istenir.'}</p>
+    <label class="field"><span>Parolanız</span><input type="password" name="password" required autocomplete="current-password"></label>
+    <div><button class="btn primary">Kurulumu başlat</button></div></form>`;
+}
 const ADMIN_VIEWS = ['settings', 'users', 'audit'], STATIC_VIEWS = ['settings', 'users', 'account', 'audit'];
 
 // ---------------------------------------------------------------- yönlendirme ve olaylar
-function route() { const [, name = '', arg] = location.hash.split('/'); return { name: views[name] && (!ADMIN_VIEWS.includes(name) || isAdmin()) && (name !== 'dlp' || canEdit()) ? name : '', arg }; }
+function route() {
+  if (ui.recovery) return { name: 'account' };   // kurtarma kodları kaydedilene kadar başka sayfaya geçilmez
+  const [, name = '', arg] = location.hash.split('/'); return { name: views[name] && (!ADMIN_VIEWS.includes(name) || isAdmin()) && (name !== 'dlp' || canEdit()) ? name : '', arg }; }
 async function render(auto = false) {
   clearTimeout(timer);
   if (!ui.me) { try { ui.me = await api('/api/me'); } catch (err) { return; } }
@@ -457,6 +499,12 @@ async function render(auto = false) {
   // Kullanıcı bir alana yazarken otomatik yenileme içeriği ezmesin.
   if (auto && (STATIC_VIEWS.includes(r.name) || (document.activeElement && ['INPUT', 'SELECT'].includes(document.activeElement.tagName)))) { timer = setTimeout(() => render(true), 15000); return; }
   try {
+    if (ui.me.must_setup_2fa) {   // zorunlu kurulum: yalnızca hesap sayfası açılır
+      const forced = await views.account();
+      app.innerHTML = h`<div class="shell"><main class="main" id="main" style="max-width:720px;margin:0 auto"><div class="brand" style="padding:0">Nöbet</div>${forced}
+        <div><button type="button" class="btn" data-act="logout">Oturumu kapat</button></div></main></div>`.s;
+      return;
+    }
     if (!ui.companies.length) ui.companies = (await api('/api/companies')).companies;
     if (ui.company && !ui.companies.some((c) => String(c.id) === ui.company)) ui.company = '';
     const content = await views[r.name](r.arg);
@@ -488,6 +536,10 @@ const actions = {
   },
   'dlp-hours': (v) => { ui.dlpHours = Number(v); },
   'watch-delete': async (v, el) => { if (!confirm(`${el.dataset.name} klasörünün izlenmesi kaldırılsın mı?`)) return false; await api(`/api/watchpaths/${v}/delete`, {}); },
+  'login-back': () => { showLogin(); return false; },
+  'totp-cancel': () => { ui.totpSetup = null; },
+  'recovery-done': () => { ui.recovery = null; },
+  'user-reset-totp': async (v, el) => { if (!confirm(`${el.dataset.name} için iki adımlı doğrulama sıfırlansın mı? Kullanıcının oturumları kapanır.`)) return false; await api(`/api/users/${v}`, { reset_totp: true }); toast('İki adımlı doğrulama sıfırlandı.'); },
   'audit-area': (v) => { ui.auditArea = v; ui.auditPages = []; },
   'audit-older': (v) => { ui.auditPages.push(v); },
   'audit-newest': () => { ui.auditPages = []; },
@@ -506,7 +558,10 @@ document.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const form = ev.target, data = Object.fromEntries(new FormData(form));
   try {
-    if (form.id === 'login-form') { await api('/api/login', data); ui.companies = []; ui.me = null; return render(); }
+    if (form.id === 'login-form') { await api('/api/login', data); ui.companies = []; ui.me = null; ui.totpSetup = null; ui.recovery = null; return render(); }
+    if (form.dataset.form === 'totp-setup') { ui.totpSetup = await api('/api/me/totp_setup', data); }
+    if (form.dataset.form === 'totp-enable') { ui.recovery = (await api('/api/me/totp_enable', data)).recovery_codes; ui.totpSetup = null; ui.me = null; }
+    if (form.dataset.form === 'totp-disable') { await api('/api/me/totp_disable', data); ui.me = null; toast('İki adımlı doğrulama kapatıldı.'); }
     if (form.dataset.form === 'user-new' || form.dataset.form === 'user-edit') {
       const fd = new FormData(form);
       const body = { role: data.role, all_companies: !!form.all_companies.checked, companies: fd.getAll('companies').map(Number) };
@@ -520,9 +575,14 @@ document.addEventListener('submit', async (ev) => {
     if (form.dataset.form === 'password') { await api('/api/me/password', data); toast('Parola değiştirildi.'); }
     if (form.dataset.form === 'company-new') { ui.newToken = await api('/api/companies', data); }
     if (form.dataset.form === 'company-chat') { await api(`/api/companies/${form.dataset.id}`, data); toast('Kaydedildi.'); }
-    if (form.dataset.form === 'settings') { data.notify_warn = form.notify_warn.checked ? 1 : 0; await api('/api/settings', data); toast('Ayarlar kaydedildi.'); }
+    if (form.dataset.form === 'settings') { data.notify_warn = form.notify_warn.checked ? 1 : 0; data.require_2fa = form.require_2fa.checked ? 1 : 0; await api('/api/settings', data); toast('Ayarlar kaydedildi.'); }
     render();
-  } catch (err) { if (form.id === 'login-form') showLogin(err.message); else toast(err.message); }
+  } catch (err) {
+    if (form.id !== 'login-form') return toast(err.message);
+    // Parola doğruysa ikinci adım ekranı açılır; ilk geçişte hata metni gösterilmez.
+    if (err.data && err.data.totp_required) showLogin(data.code ? err.message : '', { username: data.username, password: data.password });
+    else showLogin(err.message);
+  }
 });
 document.addEventListener('change', (ev) => { if (ev.target.id === 'company') { actions.company(ev.target.value); render(); } });
 document.addEventListener('input', (ev) => {

@@ -88,3 +88,5 @@ tr:last-child td { border-bottom: 0; }
 .error { color: var(--crit); min-height: 20px; }
 .toast { position: fixed; right: 16px; bottom: 16px; max-width: 360px; background: var(--active); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; }
 @media (max-width: 640px) { .main { padding: 20px 16px 32px; } }
+/* Dikey yığılan formlarda alanlar yükseklikte esnemesin (flex-basis satır düzeni içindir). */
+[style*="flex-direction:column"] > .field, .login form > .field { flex: none; }

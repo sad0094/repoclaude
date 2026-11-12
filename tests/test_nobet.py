@@ -20,7 +20,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "agent"))
 
 import nobet_agent as agent  # noqa: E402
-from manager import notify  # noqa: E402
+from manager import notify, totp  # noqa: E402
 from manager.__main__ import build  # noqa: E402
 from manager.db import hash_password  # noqa: E402
 from manager.web import make_server  # noqa: E402
@@ -79,10 +79,13 @@ class ManagerTest(unittest.TestCase):
         self.tg.server_close()
         self.tmp.cleanup()
 
-    def login(self, username, password):
+    def login(self, username, password, code=None):
         saved, self.cookie = self.cookie, ""
         try:
-            resp = self.call("/api/login", {"username": username, "password": password}, raw=True)
+            body = {"username": username, "password": password}
+            if code is not None:
+                body["code"] = code
+            resp = self.call("/api/login", body, raw=True)
             return resp.headers["Set-Cookie"].split(";")[0]
         finally:
             self.cookie = saved
@@ -279,6 +282,118 @@ class ManagerTest(unittest.TestCase):
         from manager.db import check_password
         self.assertTrue(check_password("eski-parola", user["password_hash"]))
         self.assertEqual(db.get("admin_hash"), "")
+
+    # ---------------------------------------------------------------- iki adımlı doğrulama
+    def error(self, path, body):
+        """İsteğin hata yanıtını (durum, gövde) olarak döndürür."""
+        try:
+            self.call(path, body)
+        except urllib.error.HTTPError as err:
+            return err.code, json.loads(err.read())
+        self.fail("hata bekleniyordu")
+
+    def enroll(self, password="parola-12345"):
+        """Geçerli oturumdaki kullanıcı için iki adımlı doğrulamayı kurar; (gizli anahtar, kurtarma kodları)."""
+        secret = self.call("/api/me/totp_setup", {"password": password})["secret"]
+        codes = self.call("/api/me/totp_enable", {"code": totp.code_at(secret, int(time.time() // 30))})["recovery_codes"]
+        return secret, codes
+
+    def test_totp_matches_rfc6238_vectors(self):
+        import base64
+        secret = base64.b32encode(b"12345678901234567890").decode()
+        self.assertEqual([totp.code_at(secret, t // 30) for t in (59, 1111111109, 2000000000)],
+                         ["287082", "081804", "279037"])
+        self.assertEqual(totp.verify(secret, "287 082", now=59), 1)
+        self.assertEqual(totp.verify(secret, "287082", now=89), 1)           # bir adım saat kayması
+        self.assertIsNone(totp.verify(secret, "287082", now=150))            # süresi geçmiş
+        self.assertIsNone(totp.verify(secret, "287082", last_step=1, now=59))  # aynı kod ikinci kez
+        self.assertIsNone(totp.verify(secret, "abc", now=59))
+
+    def test_two_factor_enrollment_and_login(self):
+        self.make_user("ayse", "operator", [self.xxxx])
+        self.as_user("ayse")
+        self.assertEqual(self.status("/api/me/totp_setup", {"password": "yanlis"}), 400)
+        secret = self.call("/api/me/totp_setup", {"password": "parola-12345"})["secret"]
+        self.assertFalse(self.call("/api/me")["totp_enabled"])                # kod doğrulanmadan etkin olmaz
+        self.assertEqual(self.status("/api/me/totp_enable", {"code": "000000"}), 400)
+        now_step = int(time.time() // 30)
+        codes = self.call("/api/me/totp_enable", {"code": totp.code_at(secret, now_step)})["recovery_codes"]
+        me = self.call("/api/me")
+        self.assertEqual((me["totp_enabled"], me["recovery_codes_left"], len(codes)), (True, 8, 8))
+        self.assertNotIn(codes[0], json.dumps(self.db.q("SELECT * FROM recovery_codes")))   # yalnızca özet saklanır
+
+        # Parola tek başına yetmez; kod istenir ve bu bir hata sayılmaz.
+        status, body = self.error_login("ayse", "parola-12345")
+        self.assertEqual((status, body.get("totp_required")), (401, True))
+        status, body = self.error_login("ayse", "parola-12345", "000000")
+        self.assertEqual((status, body.get("totp_required")), (401, True))
+        # Kurulumda kullanılan kod tekrar kullanılamaz; sonraki adımın kodu geçerlidir.
+        self.assertEqual(self.error_login("ayse", "parola-12345", totp.code_at(secret, now_step))[0], 401)
+        self.cookie = self.login("ayse", "parola-12345", totp.code_at(secret, now_step + 1))
+        self.assertEqual(self.status("/api/hosts"), 200)
+        # Kurtarma kodu bir kez çalışır.
+        self.cookie = self.login("ayse", "parola-12345", codes[0].upper().replace("-", " "))
+        self.assertEqual(self.call("/api/me")["recovery_codes_left"], 7)
+        self.assertEqual(self.error_login("ayse", "parola-12345", codes[0])[0], 401)
+        # Kapatmak için parola ve kod gerekir.
+        self.assertEqual(self.status("/api/me/totp_disable", {"password": "parola-12345", "code": "000000"}), 400)
+        self.call("/api/me/totp_disable", {"password": "parola-12345", "code": codes[1]})
+        self.assertFalse(self.call("/api/me")["totp_enabled"])
+        self.cookie = self.login("ayse", "parola-12345")
+
+    def error_login(self, username, password, code=None):
+        saved, self.cookie = self.cookie, ""
+        try:
+            body = {"username": username, "password": password}
+            if code is not None:
+                body["code"] = code
+            return self.error("/api/login", body)
+        finally:
+            self.cookie = saved
+
+    def test_two_factor_required_setting_and_admin_reset(self):
+        uid = self.make_user("mehmet", "viewer", [self.xxxx])
+        admin_secret, _ = self.enroll("gizli-parola")
+        self.call("/api/settings", {"require_2fa": "1"})
+        admin_cookie = self.cookie
+        self.as_user("mehmet")
+        me = self.call("/api/me")
+        self.assertEqual((me["must_setup_2fa"], me["totp_enabled"]), (True, False))
+        try:
+            self.call("/api/hosts")
+            self.fail("kurulum yapılmadan erişim engellenmeliydi")
+        except urllib.error.HTTPError as err:
+            self.assertEqual((err.code, json.loads(err.read()).get("setup_2fa")), (403, True))
+        secret, _ = self.enroll()
+        self.assertEqual(self.status("/api/hosts"), 200)                      # kurulumdan sonra erişim açılır
+        self.assertFalse(self.call("/api/me")["must_setup_2fa"])
+        # Telefonunu kaybeden kullanıcı için yönetici sıfırlar; oturumları kapanır.
+        mehmet_cookie = self.cookie
+        self.cookie = admin_cookie
+        self.assertTrue([u for u in self.call("/api/users")["users"] if u["id"] == uid][0]["totp_enabled"])
+        self.call(f"/api/users/{uid}", {"reset_totp": True})
+        self.cookie = mehmet_cookie
+        self.assertEqual(self.status("/api/me"), 401)
+        self.cookie = admin_cookie
+        self.cookie = self.login("mehmet", "parola-12345")                    # artık kod istenmez
+        self.assertTrue(self.call("/api/me")["must_setup_2fa"])
+        self.cookie = admin_cookie
+        actions = [(e["action"], e["detail"]) for e in self.call("/api/audit")["entries"]]
+        self.assertIn(("user.update", "iki adımlı doğrulama sıfırlandı"), actions)
+        self.assertIn(("auth.totp_enabled", ""), actions)
+        dump = json.dumps(self.call("/api/audit")["entries"]) + json.dumps(self.call("/api/users"))
+        for secret_value in (secret, admin_secret):
+            self.assertNotIn(secret_value, dump)
+
+    def test_wrong_codes_are_rate_limited_per_account(self):
+        self.make_user("ayse", "operator", [self.xxxx])
+        self.as_user("ayse")
+        self.enroll()
+        for _ in range(5):
+            self.assertEqual(self.error_login("ayse", "parola-12345", "123456")[0], 401)
+        self.assertEqual(self.error_login("ayse", "parola-12345", "123456")[0], 429)
+        failed = [e for e in self.db.q("SELECT * FROM audit_log WHERE action='auth.login_failed'")]
+        self.assertEqual((len(failed), failed[0]["detail"]), (5, "doğrulama kodu hatalı"))
 
     # ---------------------------------------------------------------- işlem günlüğü
     def audit(self, **params):

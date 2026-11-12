@@ -109,7 +109,12 @@ CREATE TABLE IF NOT EXISTS users(
   role TEXT NOT NULL,                 -- admin | operator | viewer
   all_companies INTEGER DEFAULT 0,    -- 1: tüm şirketler (admin için her zaman geçerli)
   active INTEGER DEFAULT 1,
-  created_at REAL, last_login REAL
+  created_at REAL, last_login REAL,
+  totp_secret TEXT, totp_enabled INTEGER DEFAULT 0, totp_last_step INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS recovery_codes(
+  user_id INTEGER NOT NULL, code_hash TEXT NOT NULL, used_at REAL,
+  PRIMARY KEY(user_id, code_hash)
 );
 CREATE TABLE IF NOT EXISTS user_companies(
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -126,11 +131,11 @@ DEFAULTS = {
     "offline_seconds": "120", "device_offline_seconds": "600",
     "scan_ports": "15", "brute_fails": "10", "check_fail_count": "2", "cert_warn_days": "14",
     "usb_alert": "1", "dlp_delete_threshold": "50", "dlp_read_threshold": "500", "dlp_retention_days": "30",
-    "reminder_minutes": "15", "notify_warn": "0",
+    "reminder_minutes": "15", "notify_warn": "0", "require_2fa": "0",
     "telegram_bot_token": "", "telegram_chat_id": "", "webhook_url": "", "panel_url": "",
 }
 NUMERIC = {"disk_warn", "disk_crit", "cpu_warn", "mem_warn", "offline_seconds",
-           "device_offline_seconds", "scan_ports", "brute_fails", "check_fail_count", "cert_warn_days",
+           "require_2fa", "device_offline_seconds", "scan_ports", "brute_fails", "check_fail_count", "cert_warn_days",
            "usb_alert", "dlp_delete_threshold", "dlp_read_threshold", "dlp_retention_days", "reminder_minutes", "notify_warn"}
 
 
@@ -166,6 +171,10 @@ class DB:
         if columns("sessions") and "user_id" not in columns("sessions"):
             c.execute("DROP TABLE sessions")  # eski oturumlar kullanıcıya bağlı değil; yeniden giriş gerekir
         c.executescript(SCHEMA)
+        for column, kind in (("totp_secret", "TEXT"), ("totp_enabled", "INTEGER DEFAULT 0"),
+                             ("totp_last_step", "INTEGER DEFAULT 0")):
+            if column not in columns("users"):
+                c.execute(f"ALTER TABLE users ADD COLUMN {column} {kind}")
         if "acked_by" not in columns("alerts"):
             c.execute("ALTER TABLE alerts ADD COLUMN acked_by TEXT")
         legacy = c.execute("SELECT value FROM settings WHERE key='admin_hash'").fetchone()

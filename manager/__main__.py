@@ -40,10 +40,22 @@ def main():
     ap.add_argument("--trust-proxy", action="store_true",
                     help="istemci adresini X-Forwarded-For başlığından al (yalnızca ters vekil arkasında)")
     ap.add_argument("--set-password", action="store_true", help="bir kullanıcının parolasını değiştir ve çık")
-    ap.add_argument("--user", default="admin", help="--set-password için kullanıcı adı (varsayılan: admin)")
+    ap.add_argument("--reset-2fa", action="store_true",
+                    help="bir kullanıcının iki adımlı doğrulamasını kaldır ve çık (telefon kaybı)")
+    ap.add_argument("--user", default="admin", help="--set-password / --reset-2fa için kullanıcı adı (varsayılan: admin)")
     args = ap.parse_args()
 
     db, notifier, engine, app = build(args.db)
+
+    if args.reset_2fa:
+        user = db.one("SELECT id FROM users WHERE username=?", (args.user,))
+        if not user:
+            sys.exit(f"Kullanıcı bulunamadı: {args.user}")
+        app.reset_totp(user["id"])
+        db.write("DELETE FROM sessions WHERE user_id=?", (user["id"],))
+        app.audit({"username": "komut-satırı"}, "user.update", args.user, "iki adımlı doğrulama sıfırlandı")
+        print(f"{args.user} için iki adımlı doğrulama kaldırıldı.")
+        return
 
     if args.set_password:
         user = db.one("SELECT id FROM users WHERE username=?", (args.user,))
