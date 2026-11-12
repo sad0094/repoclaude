@@ -14,7 +14,7 @@ doğrulananlar/doğrulanmayanlar ve sıradaki adımlar bulunsun. Aynı bilgiyi b
 Çok şirketli (MSP tarzı) IT monitörleme. Her müşteri şirketin sunucusuna **Agent** kurulur,
 hepsi tek merkezi **Manager** paneline rapor gönderir (bağlantıyı her zaman Agent başlatır).
 Kritik uyarılar Telegram botuna/webhook'a gider ve onaylanana kadar tekrarlanır.
-Ürün adı (geçici): "Nöbet". Depo: `sad0094/repoclaude`, çalışma dalı `claude/adoring-hawking-c6u5l0`.
+Ürün adı (geçici): "Nöbet". Depo: `sad0094/repoclaude`, çalışma dalı `claude/stoic-lamport-6xe26u`.
 
 ## Yapı
 
