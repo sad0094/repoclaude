@@ -17,6 +17,7 @@ SESSION_TTL = 7 * 86400
 MAX_BODY = 4 * 1024 * 1024
 COOKIE = "nobet_session"
 CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{1,23}$")
+HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
 ROLES = ("admin", "operator", "viewer")   # yönetici, operatör, izleyici
 # Kullanıcı yokken de aynı süre harcansın diye doğrulanan sahte özet (kullanıcı adı sızdırmamak için).
@@ -278,7 +279,7 @@ class App:
                 "devices_total": len(devices), "devices_online": sum(1 for d in devices if d["online"]),
                 "alerts": {s: sum(1 for a in open_alerts if a["severity"] == s) for s in ("crit", "warn", "info")},
                 "attempts_24h": conn["attempts"], "closed_24h": conn["closed"]},
-            "companies": companies, "traffic": self.traffic(user, query),
+            "companies": companies, "traffic": self.traffic(user, query), "checks": self.checks(user, query),
             "alerts": open_alerts[:6], "hosts": hosts}
 
     def host_detail(self, user, host_id):
@@ -337,6 +338,98 @@ class App:
             f"WHERE e.ts>=?{clause} ORDER BY e.ts DESC, e.id DESC LIMIT 50", args)
         return {"now": now, "hours": hours, "totals": totals, "sources": sources, "ports": ports,
                 "users": users, "timeline": timeline, "recent": recent}
+
+    # ------------------------------------------------------------------ servis kontrolleri
+    def checks(self, user, query):
+        clause, args = self._scope(user, query, "k.company_id")
+        rows = self.db.q(
+            "SELECT k.*, h.hostname, h.last_seen host_seen, c.code company_code FROM checks k "
+            "JOIN hosts h ON h.id=k.host_id JOIN companies c ON c.id=k.company_id WHERE 1=1" + clause +
+            " ORDER BY c.code, k.name", args)
+        now, limit = time.time(), self._online_after()
+        for r in rows:
+            stale = not (r["host_seen"] and r["host_seen"] >= limit)
+            # Kapalı kontrol ya da çevrimdışı ajan: son bilinen durum güncel sayılmaz.
+            r["state"] = "off" if not r["enabled"] else "unknown" if stale or not r["checked_at"] else r["status"]
+            up = self.db.one("SELECT AVG(ok) up, COUNT(*) n FROM check_results WHERE check_id=? AND ts>=?",
+                             (r["id"], now - 86400))
+            r["uptime_24h"] = round(up["up"] * 100, 2) if up["n"] else None
+            r["history"] = list(reversed(self.db.q(
+                "SELECT ts, ok, latency_ms FROM check_results WHERE check_id=? ORDER BY ts DESC LIMIT 40", (r["id"],))))
+        return rows
+
+    @staticmethod
+    def _check_fields(body, current=None):
+        """Kontrol tanımını doğrular. Ajanlar bu hedeflere bağlanacağı için biçim sıkı tutulur."""
+        cur = current or {}
+        kind = body.get("type", cur.get("type"))
+        name = str(body.get("name", cur.get("name", ""))).strip()[:80]
+        target = str(body.get("target", cur.get("target", ""))).strip()
+        if kind not in ("tcp", "http"):
+            raise HttpError(400, "Tür tcp veya http olmalı.")
+        if not name:
+            raise HttpError(400, "Kontrol adı gerekli.")
+        if len(target) > 300 or any(ch.isspace() or not ch.isprintable() for ch in target):
+            raise HttpError(400, "Geçersiz hedef.")
+        if kind == "tcp":
+            host, _, port = target.rpartition(":")
+            if not HOSTNAME_RE.match(host) or not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise HttpError(400, "TCP hedefi sunucu:port biçiminde olmalı (ör. 10.0.0.5:5432).")
+        else:
+            url = urlparse(target)
+            if url.scheme not in ("http", "https") or not url.hostname or not HOSTNAME_RE.match(url.hostname):
+                raise HttpError(400, "HTTP hedefi http:// veya https:// ile başlayan bir adres olmalı.")
+            if url.username or url.password:
+                raise HttpError(400, "Adrese kullanıcı adı veya parola yazmayın.")
+
+        def number(key, lo, hi):
+            value = body.get(key, cur.get(key))
+            if value in (None, ""):
+                return None
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                raise HttpError(400, f"{key} sayı olmalı.")
+            if not lo <= value <= hi:
+                raise HttpError(400, f"{key} {lo}-{hi} aralığında olmalı.")
+            return value
+        return {"name": name, "type": kind, "target": target,
+                "expect_status": number("expect_status", 100, 599) if kind == "http" else None,
+                "slow_ms": number("slow_ms", 1, 600000),
+                "verify": 1 if body.get("verify", cur.get("verify", 1)) else 0,
+                "enabled": 1 if body.get("enabled", cur.get("enabled", 1)) else 0}
+
+    def create_check(self, body, host):
+        f = self._check_fields(body)
+        if self.db.one("SELECT COUNT(*) n FROM checks WHERE host_id=?", (host["id"],))["n"] >= 50:
+            raise HttpError(400, "Bir sunucuya en fazla 50 kontrol atanabilir.")
+        cur = self.db.write(
+            "INSERT INTO checks(company_id,host_id,name,type,target,expect_status,slow_ms,verify,enabled,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (host["company_id"], host["id"], f["name"], f["type"], f["target"], f["expect_status"], f["slow_ms"],
+             f["verify"], f["enabled"], time.time()))
+        return {"id": cur.lastrowid}
+
+    def update_check(self, check_id, body):
+        current = self.db.one("SELECT * FROM checks WHERE id=?", (check_id,))
+        f = self._check_fields(body, current)
+        if f["type"] != current["type"]:
+            raise HttpError(400, "Kontrol türü değiştirilemez; yeni bir kontrol ekleyin.")
+        if not f["enabled"] or f["target"] != current["target"]:
+            self.engine.retire_check(check_id)
+        reset = ", status='unknown', fails=0, checked_at=NULL, cert_days=NULL, detail=''" \
+            if f["target"] != current["target"] else ""
+        self.db.write(f"UPDATE checks SET name=?, target=?, expect_status=?, slow_ms=?, verify=?, enabled=?{reset} "
+                      "WHERE id=?", (f["name"], f["target"], f["expect_status"], f["slow_ms"], f["verify"],
+                                     f["enabled"], check_id))
+        return {"ok": True}
+
+    def delete_check(self, check_id):
+        self.engine.retire_check(check_id)
+        with self.db.tx() as c:
+            c.execute("DELETE FROM check_results WHERE check_id=?", (check_id,))
+            c.execute("DELETE FROM checks WHERE id=?", (check_id,))
+        return {"ok": True}
 
     def companies(self, user):
         rows = self.db.q(
@@ -484,8 +577,9 @@ def make_handler(app):
                 company = app.db.company_by_token(auth[7:]) if auth.startswith("Bearer ") else None
                 if not company:
                     raise HttpError(401, "Geçersiz ajan anahtarı.")
-                app.engine.ingest(company, self._body())
-                return self._send(200, {"ok": True, "company": company["code"]})
+                host_id = app.engine.ingest(company, self._body())
+                return self._send(200, {"ok": True, "company": company["code"],
+                                        "checks": app.engine.agent_checks(company["id"], host_id)})
             if (method, path) == ("POST", "/api/login"):
                 body = self._body()
                 token = app.login(str(body.get("username", "")), str(body.get("password", "")),
@@ -533,6 +627,8 @@ def make_handler(app):
                     return self._send(200, {"now": time.time(), "alerts": app.alerts(user, query)})
                 if resource == "companies":
                     return self._send(200, {"companies": app.companies(user)})
+                if resource == "checks":
+                    return self._send(200, {"now": time.time(), "checks": app.checks(user, query)})
                 if resource == "settings":
                     admin_only()
                     return self._send(200, app.settings_view())
@@ -562,6 +658,21 @@ def make_handler(app):
                 if "label" in body:
                     app.db.write("UPDATE devices SET label=? WHERE id=?", (str(body["label"]).strip()[:80], rid))
                 return self._send(200, {"ok": True})
+
+            if resource == "checks" and rid and action == "delete":
+                owned("checks", rid)
+                return self._send(200, app.delete_check(rid))
+            if resource == "checks" and rid:
+                owned("checks", rid)
+                return self._send(200, app.update_check(rid, body))
+            if resource == "checks":
+                try:
+                    host_id = int(body.get("host_id"))
+                except (TypeError, ValueError):
+                    raise HttpError(400, "Kontrolü çalıştıracak sunucuyu seçin.")
+                owned("hosts", host_id)
+                host = app.db.one("SELECT id, company_id FROM hosts WHERE id=?", (host_id,))
+                return self._send(201, app.create_check(body, host))
 
             # --- yalnızca yönetici ---
             admin_only()

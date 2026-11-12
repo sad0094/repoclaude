@@ -10,6 +10,7 @@ Collects and reports to the Nobet Manager:
                          install.ps1 -EnableConnectionAudit turns on)
       capture = "poll" : established connections only (no policy change needed)
   * Windows logon attempts (Security events 4625 failed, 4624 successful; network and RDP)
+  * service health checks defined in the Manager (TCP port, HTTP/HTTPS URL, certificate expiry)
 
 Usage:
   nobet-agent.ps1                      # uses %ProgramData%\Nobet\agent.json
@@ -42,6 +43,7 @@ $script:PendingConn = @{}    # "src|port|open" -> count
 $script:PendingAuth = @{}    # "src|user|result|port" -> count
 $script:SeenConn = @{}       # poll mode: currently established tuples
 $script:PollReady = $false
+$script:Checks = @()         # check definitions received in the Manager's last reply
 $script:LastRecord = [long]-1
 $script:LastScan = [datetime]::MinValue
 $script:PrevNet = $null
@@ -318,6 +320,89 @@ function Update-PolledConnections($LocalIps) {
     $script:PollReady = $true   # connections that existed at startup are not counted as new
 }
 
+# ------------------------------------------------------------------ service health checks
+function Get-AcceptAllCallback {
+    # Compiled callback for checks with certificate verification turned off. A script block
+    # cannot be used here: .NET may invoke the callback on a thread without a PowerShell runspace.
+    if (-not ('NobetTls' -as [type])) {
+        Add-Type -TypeDefinition @'
+public static class NobetTls {
+    public static bool AcceptAll(object sender, System.Security.Cryptography.X509Certificates.X509Certificate cert,
+        System.Security.Cryptography.X509Certificates.X509Chain chain, System.Net.Security.SslPolicyErrors errors) { return true; }
+}
+'@
+    }
+    return [System.Delegate]::CreateDelegate([System.Net.Security.RemoteCertificateValidationCallback], [NobetTls].GetMethod('AcceptAll'))
+}
+
+function Invoke-ServiceCheck($Check) {
+    # Only status and timing go back to the Manager; response bodies are never sent.
+    $result = @{ id = $Check.id; ok = $false }
+    $timeoutMs = 5000
+    if ($Check.timeout) { $timeoutMs = [Math]::Min([Math]::Max([int]$Check.timeout, 1), 10) * 1000 }
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        if ($Check.type -eq 'tcp') {
+            $target = [string]$Check.target
+            $split = $target.LastIndexOf(':')
+            $client = New-Object System.Net.Sockets.TcpClient
+            try {
+                $pending = $client.BeginConnect($target.Substring(0, $split), [int]$target.Substring($split + 1), $null, $null)
+                if (-not $pending.AsyncWaitHandle.WaitOne($timeoutMs)) { throw 'Timeout' }
+                $client.EndConnect($pending)
+                $result.ok = $true
+            } finally { $client.Close() }
+        }
+        elseif ($Check.type -eq 'http') {
+            $request = [System.Net.HttpWebRequest]::Create([string]$Check.target)
+            $request.Method = 'GET'
+            $request.AllowAutoRedirect = $false
+            $request.Timeout = $timeoutMs
+            $request.ReadWriteTimeout = $timeoutMs
+            $request.UserAgent = 'nobet-agent/' + $script:Version
+            $request.KeepAlive = $false
+            if ($Check.verify -eq $false) { $request.ServerCertificateValidationCallback = Get-AcceptAllCallback }
+            $response = $null
+            try { $response = $request.GetResponse() }
+            catch {
+                # 4xx/5xx arrive as a WebException (possibly wrapped) that still carries the response.
+                $ex = $_.Exception
+                while ($ex -and -not ($ex -is [System.Net.WebException])) { $ex = $ex.InnerException }
+                if ($ex -and $ex.Response) { $response = $ex.Response } else { throw }
+            }
+            $status = [int]$response.StatusCode
+            $response.Close()
+            $result.status_code = $status
+            if ($request.RequestUri.Scheme -eq 'https' -and $Check.verify -ne $false -and $request.ServicePoint.Certificate) {
+                $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $request.ServicePoint.Certificate
+                $result.cert_days = [Math]::Round(($cert.NotAfter - (Get-Date)).TotalDays, 1)
+            }
+            if ($Check.expect_status) { $result.ok = ($status -eq [int]$Check.expect_status) }
+            else { $result.ok = ($status -ge 200 -and $status -lt 400) }
+            if (-not $result.ok) { $result.error = 'HTTP ' + $status }
+        }
+        else { throw 'Unknown check type' }
+    } catch {
+        $message = [string]$_.Exception.Message
+        if ($_.Exception.InnerException) { $message = [string]$_.Exception.InnerException.Message }
+        if ($message.Length -gt 160) { $message = $message.Substring(0, 160) }
+        $result.error = $message
+    }
+    $result.latency_ms = [Math]::Round($watch.Elapsed.TotalMilliseconds, 1)
+    return $result
+}
+
+function Invoke-ServiceChecks {
+    # Checks run one after another; a 20 second budget keeps a slow batch from delaying the report.
+    $results = @()
+    $budget = [System.Diagnostics.Stopwatch]::StartNew()
+    foreach ($check in @($script:Checks | Select-Object -First 50)) {
+        if ($budget.Elapsed.TotalSeconds -gt 20) { break }
+        $results += (Invoke-ServiceCheck $check)
+    }
+    return , $results
+}
+
 # ------------------------------------------------------------------ report
 function New-Report($cfg, $Local) {
     $m = Get-Metrics
@@ -348,6 +433,7 @@ function New-Report($cfg, $Local) {
         connections   = $connections
         auth          = $auth
     }
+    if (@($script:Checks).Count -gt 0 -and $cfg.checks -ne $false) { $report.checks = (Invoke-ServiceChecks) }
     if ($cfg.discovery -and ((Get-Date) - $script:LastScan).TotalSeconds -ge [int]$cfg.scan_interval) {
         $report.devices = (Invoke-Discovery $Local.Nets)
         $script:LastScan = Get-Date
@@ -358,9 +444,11 @@ function New-Report($cfg, $Local) {
 function Send-Report($cfg, $Report) {
     $json = $Report | ConvertTo-Json -Depth 6 -Compress
     $body = [System.Text.Encoding]::UTF8.GetBytes($json)
-    Invoke-RestMethod -Uri ($cfg.manager.TrimEnd('/') + '/api/agent/report') -Method Post -Body $body `
+    $reply = Invoke-RestMethod -Uri ($cfg.manager.TrimEnd('/') + '/api/agent/report') -Method Post -Body $body `
         -ContentType 'application/json' -Headers @{ Authorization = 'Bearer ' + $cfg.token } `
-        -UserAgent ('nobet-agent/' + $script:Version) -TimeoutSec 20 -UseBasicParsing | Out-Null
+        -UserAgent ('nobet-agent/' + $script:Version) -TimeoutSec 20 -UseBasicParsing
+    # The reply carries the checks this server should run (an empty list clears them).
+    if ($null -ne $reply -and ($reply.PSObject.Properties.Name -contains 'checks')) { $script:Checks = @($reply.checks) }
 }
 
 function Invoke-Cycle($cfg, $Local) {

@@ -146,7 +146,7 @@ class Engine:
         disk_max = max((d["pct"] for d in disks), default=None)
         cfg = {k: self.db.num(k) for k in
                ("disk_warn", "disk_crit", "cpu_warn", "mem_warn", "scan_ports", "brute_fails",
-                "device_offline_seconds")}
+                "device_offline_seconds", "check_fail_count", "cert_warn_days")}
 
         with self.db.tx() as c:
             c.execute(
@@ -173,7 +173,58 @@ class Engine:
             self._ingest_connections(c, cid, hid, payload, listening, cfg, now)
             if isinstance(payload.get("devices"), list):
                 self._ingest_devices(c, cid, hid, payload["devices"], had_scan, cfg, now)
+            if isinstance(payload.get("checks"), list):
+                self._ingest_checks(c, cid, hid, payload["checks"], cfg, now)
         return hid
+
+    # ------------------------------------------------------------------ servis sağlık kontrolleri
+    def agent_checks(self, company_id, host_id):
+        """Ajanın çalıştıracağı kontrol listesi (rapor yanıtında gönderilir)."""
+        return [{"id": r["id"], "type": r["type"], "target": r["target"], "expect_status": r["expect_status"],
+                 "verify": bool(r["verify"]), "timeout": 5}
+                for r in self.db.q("SELECT * FROM checks WHERE company_id=? AND host_id=? AND enabled=1 ORDER BY id",
+                                   (company_id, host_id))]
+
+    def _ingest_checks(self, c, cid, hid, results, cfg, now):
+        # Ajan yalnızca kendi sunucusuna atanmış kontroller için sonuç bildirebilir.
+        known = {r["id"]: r for r in c.execute(
+            "SELECT * FROM checks WHERE company_id=? AND host_id=? AND enabled=1", (cid, hid)).fetchall()}
+        for r in results[:200]:
+            chk = known.get(_i(r.get("id"))) if isinstance(r, dict) else None
+            if not chk:
+                continue
+            ok = r.get("ok") is True
+            latency, cert = _f(r.get("latency_ms"), 0, 600000), _f(r.get("cert_days"), -36500, 36500)
+            error = _s(r.get("error"), 200)
+            fails = 0 if ok else chk["fails"] + 1
+            status, detail = ("ok", "") if ok else ("crit", error or "Yanıt yok")
+            if ok and chk["slow_ms"] and latency is not None and latency > chk["slow_ms"]:
+                status, detail = "warn", f"Yavaş yanıt (eşik {chk['slow_ms']} ms)"
+            changed = now if status != chk["status"] else chk["changed_at"]
+            c.execute("UPDATE checks SET status=?, latency_ms=?, status_code=?, cert_days=?, detail=?, fails=?, "
+                      "checked_at=?, changed_at=? WHERE id=?",
+                      (status, latency, _i(r.get("status_code"), 0, 999), cert, detail, fails, now, changed, chk["id"]))
+            c.execute("INSERT INTO check_results(check_id,ts,ok,latency_ms) VALUES(?,?,?,?)",
+                      (chk["id"], now, 1 if ok else 0, latency))
+            if ok:
+                self.clear_alert(c, cid, hid, f"check:{chk['id']}", now)
+            elif fails >= cfg["check_fail_count"]:   # tek seferlik takılmalar uyarı üretmesin
+                self.raise_alert(c, cid, hid, f"check:{chk['id']}", "crit", f"Servis yanıt vermiyor: {chk['name']}",
+                                 f"{chk['target']} · {detail}", now)
+            if cert is not None and cert <= cfg["cert_warn_days"]:
+                left = "süresi doldu" if cert < 0 else f"{cert:.0f} gün kaldı"
+                self.raise_alert(c, cid, hid, f"cert:{chk['id']}", "crit" if cert <= 3 else "warn",
+                                 f"Sertifika süresi doluyor: {chk['name']}", f"{chk['target']} · {left}", now)
+            elif cert is not None or chk["type"] != "http":
+                self.clear_alert(c, cid, hid, f"cert:{chk['id']}", now)
+
+    def retire_check(self, check_id):
+        """Silinen veya kapatılan kontrolün açık uyarılarını kapatır."""
+        chk = self.db.one("SELECT company_id, host_id FROM checks WHERE id=?", (check_id,))
+        if chk:
+            with self.db.tx() as c:
+                for key in (f"check:{check_id}", f"cert:{check_id}"):
+                    self.clear_alert(c, chk["company_id"], chk["host_id"], key, time.time())
 
     def _check_resources(self, c, cid, hid, disks, mem, cfg, now):
         seen = set()
@@ -301,6 +352,7 @@ class Engine:
                                    (now - reminder,)).fetchall():
                     self._notify(c, a["id"], reminder=True)
             c.execute("DELETE FROM metrics WHERE ts < ?", (now - METRIC_RETENTION,))
+            c.execute("DELETE FROM check_results WHERE ts < ?", (now - METRIC_RETENTION,))
             c.execute("DELETE FROM conn_events WHERE ts < ?", (now - EVENT_RETENTION,))
             c.execute("DELETE FROM alerts WHERE resolved_at IS NOT NULL AND resolved_at < ?", (now - EVENT_RETENTION,))
             c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))

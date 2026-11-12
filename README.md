@@ -19,6 +19,7 @@ Bağlantıyı her zaman Agent başlatır; şirket ağlarında dışarıya port a
 | Ağ cihazları | Agent yerel alt ağı tarar (ARP), ağdaki tüm cihazları IP/MAC/ad ile listeler; yeni cihaz bilgi uyarısı üretir; "İzle" denen cihaz kaybolursa kritik uyarı |
 | Bağlantı analizi | Sunucuya gelen her TCP bağlantı denemesi (kapalı portlara gelenler dahil), başarılı/başarısız oturum açmalar (Linux: SSH, Windows: RDP ve ağ); kaynak, port, kullanıcı adı ve zaman dökümü |
 | Saldırı tespiti | Port taraması (10 dk içinde 15+ farklı port) ve parola denemesi saldırısı (10 dk içinde 10+ başarısız giriş) kritik uyarı üretir |
+| Servis sağlığı | Panelden tanımlanan TCP portu ve HTTP/HTTPS kontrolleri; yanıt süresi, 24 saatlik erişilebilirlik, sertifika bitiş süresi; art arda başarısız olan servis kritik uyarı üretir |
 | Çok şirketli yönetim | Her şirketin kendi kodu ve ajan anahtarı vardır; panel tüm şirketleri birlikte veya tek tek gösterir |
 | Acil durum çağrısı | Kritik uyarılar Telegram botuna (ve isteğe bağlı webhook'a) gider; onaylanana kadar 15 dakikada bir tekrarlanır; şirket başına ayrı sohbet seçilebilir |
 
@@ -99,6 +100,22 @@ bağlantıları görür. Oturum açma denemeleri (RDP ve ağ; olay 4625/4624) he
 Kurmadan denemek için: `.\nobet-agent.ps1 -Manager https://... -Token nbt_... -Print`.
 Kaldırmak için: `.\uninstall.ps1`.
 
+## Servis sağlık kontrolleri
+
+**Servisler** sayfasından (yönetici ve operatör) kontrol eklenir: ad, tür (HTTP/HTTPS adresi veya TCP portu),
+hedef ve kontrolü çalıştıracak sunucu. Kontrolü o sunucudaki ajan **kendi ağının içinden** çalıştırır; bu sayede
+dışarıya açık olmayan iç servisler (ERP, veritabanı, dosya sunucusu) de izlenir. Tanımlar ajana rapor yanıtıyla
+gider, ayrıca ajan tarafında ayar gerekmez.
+
+- Bir kontrol art arda 2 kez başarısız olursa kritik uyarı çıkar (Telegram'a gider); düzelince kapanır.
+- HTTPS kontrollerinde sertifikanın kalan süresi izlenir: 14 gün kala uyarı, 3 gün kala kritik.
+- "Yavaş eşiği" verilirse eşiği aşan yanıtlar panelde "Yavaş" görünür (uyarı üretmez).
+- HTTP'de varsayılan başarı ölçütü 200–399 kodlarıdır; yönlendirmeler izlenmez.
+- Ajan panele yalnızca durum, HTTP kodu ve yanıt süresini bildirir; yanıt içeriği gönderilmez.
+- Bir sunucuda kontrolleri tümüyle kapatmak için `agent.json` içine `"checks": false` yazın.
+
+Eşikler **Ayarlar → Uyarı eşikleri** bölümündedir.
+
 ## Telegram
 
 1. Telegram'da @BotFather ile bot oluşturup anahtarını alın.
@@ -126,6 +143,8 @@ python3 tools/demo.py http://127.0.0.1:8080 nbt_ANAHTAR
   ortamında PowerShell yoktu. Üretime almadan önce bir test sunucusunda `-Print` ile deneyin.
   Manager'ın Windows biçimli raporu işlediği otomatik testle doğrulandı.
 - Linux ajanı `/proc` ve ham soket kullanır; Windows ajanı CIM, komşu tablosu ve Security günlüğünü kullanır.
+- Servis kontrolleri TCP ve HTTP/HTTPS ile sınırlıdır (ping, DNS, içerik eşleştirme yok); kontroller ajanın
+  rapor aralığında (varsayılan 30 sn) bir kez çalışır.
 - Bağlantı yakalama TCP içindir ve root gerektirir. Root yoksa ajan yalnızca kabul edilen
   bağlantıları görür; panel bunu sunucu sayfasında belirtir. UDP izlenmez.
 - Ağ keşfi ajanın bulunduğu alt ağla sınırlıdır (en fazla /22); yönlendirici arkasındaki ağlar görülmez.

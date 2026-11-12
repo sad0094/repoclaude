@@ -6,12 +6,14 @@ Tek dosya, yalnızca Python 3.8+ standart kitaplığı (Linux). Topladıkları:
   * yerel ağdaki tüm cihazlar (ARP tabanlı keşif)
   * sunucuya gelen bağlantı denemeleri (TCP SYN yakalama; kapalı portlara gelenler dahil)
   * SSH giriş denemeleri (başarılı/başarısız)
+  * Manager'da tanımlanan servis sağlık kontrolleri (TCP portu, HTTP/HTTPS adresi, sertifika süresi)
 
 Kullanım:  nobet_agent.py --config /etc/nobet/agent.json
            nobet_agent.py --manager https://panel.example.com --token nbt_... [--once --print]
 """
 import argparse
 import concurrent.futures
+import http.client
 import ipaddress
 import json
 import os
@@ -419,6 +421,75 @@ class AuthLog:
             return []
 
 
+# ----------------------------------------------------------------------------- servis sağlık kontrolleri
+MAX_CHECKS = 50
+
+
+def run_check(check):
+    """Tek bir kontrolü çalıştırır. Manager'a yalnızca durum/süre döner; yanıt gövdesi asla gönderilmez."""
+    timeout = min(max(float(check.get("timeout") or 5), 1), 10)
+    result = {"id": check.get("id"), "ok": False}
+    started = time.monotonic()
+    conn = None
+    try:
+        if check.get("type") == "tcp":
+            host, _, port = str(check["target"]).rpartition(":")
+            socket.create_connection((host, int(port)), timeout=timeout).close()
+            result["ok"] = True
+        elif check.get("type") == "http":
+            url = urllib.parse.urlparse(str(check["target"]))
+            if url.scheme == "https":
+                ctx = ssl.create_default_context(cafile=check.get("_cafile"))   # _cafile yalnızca testlerde
+                if not check.get("verify", True):
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                conn = http.client.HTTPSConnection(url.hostname, url.port or 443, timeout=timeout, context=ctx)
+            elif url.scheme == "http":
+                conn = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=timeout)
+            else:
+                raise ValueError("desteklenmeyen adres")
+            conn.connect()
+            if url.scheme == "https":
+                # Yanıt okununca soket kapanabildiği için sertifika istekten önce alınır;
+                # doğrulama kapalıysa boş döner ve süre bildirilmez.
+                cert = conn.sock.getpeercert()
+                if cert and cert.get("notAfter"):
+                    result["cert_days"] = round((ssl.cert_time_to_seconds(cert["notAfter"]) - time.time()) / 86400, 1)
+            path = (url.path or "/") + ("?" + url.query if url.query else "")
+            conn.request("GET", path, headers={"User-Agent": "nobet-agent/" + VERSION, "Connection": "close"})
+            status = conn.getresponse().status       # yönlendirmeler izlenmez
+            result["status_code"] = status
+            expected = check.get("expect_status")
+            result["ok"] = status == expected if expected else 200 <= status < 400
+            if not result["ok"]:
+                result["error"] = f"HTTP {status}"
+        else:
+            raise ValueError("bilinmeyen kontrol türü")
+    except ssl.SSLCertVerificationError as exc:
+        result["error"] = "Sertifika doğrulanamadı: " + str(exc.verify_message or exc)[:120]
+    except socket.timeout:
+        result["error"] = "Zaman aşımı"
+    except ConnectionRefusedError:
+        result["error"] = "Bağlantı reddedildi"
+    except socket.gaierror:
+        result["error"] = "Ad çözülemedi"
+    except (OSError, ValueError, KeyError, http.client.HTTPException) as exc:
+        result["error"] = (str(exc) or exc.__class__.__name__)[:160]
+    finally:
+        if conn is not None:
+            conn.close()
+    result["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+    return result
+
+
+def run_checks(checks):
+    checks = [c for c in checks if isinstance(c, dict)][:MAX_CHECKS]
+    if not checks:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(run_check, checks))
+
+
 # ----------------------------------------------------------------------------- ajan döngüsü
 def machine_id():
     for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
@@ -455,6 +526,7 @@ class Agent:
         self.prev_time = time.time()
         self.last_scan = 0
         self.pending_auth = {}
+        self.checks = []   # Manager'ın son rapor yanıtında gönderdiği kontrol tanımları
         self.ssl_ctx = ssl.create_default_context(cafile=cfg.get("ca_file"))
         if cfg.get("insecure"):
             print("uyarı: TLS sertifika doğrulaması kapalı (insecure)", file=sys.stderr)
@@ -500,6 +572,8 @@ class Agent:
             "auth": [{"src": s, "user": u, "result": r, "count": n}
                      for (s, u, r), n in self.pending_auth.items()],
         }
+        if self.checks and self.cfg.get("checks", True):
+            report["checks"] = run_checks(self.checks)
         if self.cfg.get("discovery", True) and time.time() - self.last_scan >= self.cfg.get("scan_interval", 300):
             report["devices"] = self.discovery.scan(self.nets)
             self.last_scan = time.time()
@@ -512,7 +586,13 @@ class Agent:
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.cfg["token"],
                      "User-Agent": "nobet-agent/" + VERSION})
         with urllib.request.urlopen(req, timeout=20, context=self.ssl_ctx) as resp:
-            resp.read()
+            body = resp.read()
+        try:
+            checks = json.loads(body).get("checks")
+            if isinstance(checks, list):
+                self.checks = checks
+        except (ValueError, AttributeError):
+            pass
 
     def run_once(self, dry_run=False):
         report, conns = self.collect()

@@ -60,6 +60,20 @@ CREATE TABLE IF NOT EXISTS alerts(
   notified_at REAL, expire_after REAL
 );
 CREATE INDEX IF NOT EXISTS alerts_open ON alerts(company_id, resolved_at);
+CREATE TABLE IF NOT EXISTS checks(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  host_id INTEGER NOT NULL,           -- kontrolü çalıştıran ajanın sunucusu
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,                 -- tcp | http
+  target TEXT NOT NULL,               -- tcp: host:port, http: URL
+  expect_status INTEGER, slow_ms INTEGER, verify INTEGER DEFAULT 1, enabled INTEGER DEFAULT 1,
+  status TEXT DEFAULT 'unknown',      -- ok | warn | crit | unknown
+  latency_ms REAL, status_code INTEGER, cert_days REAL, detail TEXT DEFAULT '',
+  fails INTEGER DEFAULT 0, checked_at REAL, changed_at REAL, created_at REAL
+);
+CREATE TABLE IF NOT EXISTS check_results(check_id INTEGER NOT NULL, ts REAL NOT NULL, ok INTEGER NOT NULL, latency_ms REAL);
+CREATE INDEX IF NOT EXISTS check_results_idx ON check_results(check_id, ts);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY,
@@ -83,12 +97,12 @@ CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER
 DEFAULTS = {
     "disk_warn": "80", "disk_crit": "90", "cpu_warn": "90", "mem_warn": "90",
     "offline_seconds": "120", "device_offline_seconds": "600",
-    "scan_ports": "15", "brute_fails": "10",
+    "scan_ports": "15", "brute_fails": "10", "check_fail_count": "2", "cert_warn_days": "14",
     "reminder_minutes": "15", "notify_warn": "0",
     "telegram_bot_token": "", "telegram_chat_id": "", "webhook_url": "", "panel_url": "",
 }
 NUMERIC = {"disk_warn", "disk_crit", "cpu_warn", "mem_warn", "offline_seconds",
-           "device_offline_seconds", "scan_ports", "brute_fails", "reminder_minutes", "notify_warn"}
+           "device_offline_seconds", "scan_ports", "brute_fails", "check_fail_count", "cert_warn_days", "reminder_minutes", "notify_warn"}
 
 
 def sha256(text):

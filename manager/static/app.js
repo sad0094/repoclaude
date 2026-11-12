@@ -72,6 +72,15 @@ function meter(v) {
   if (v === null || v === undefined) return h`<span class="muted">—</span>`;
   return h`<div class="meter"><div class="bar"><i class="${level(v)}" style="width:${Math.min(100, v)}%"></i></div>%${Math.round(v)}</div>`;
 }
+const CHECK_STATE = { ok: ['ok', 'Çalışıyor'], warn: ['warn', 'Yavaş'], crit: ['down', 'Sorunlu'], unknown: ['off', 'Bekleniyor'], off: ['off', 'Kapalı'] };
+const fmtMs = (v) => (v === null || v === undefined ? '—' : `${Math.round(v)} ms`);
+function historyStrip(points) {
+  // Son kontrollerin şeridi: mavi = başarılı, kırmızı ve kısa = başarısız (renk tek ipucu değil).
+  if (!points.length) return h`<span class="muted small">—</span>`;
+  const bars = points.map((p, i) => h`<rect x="${i * 5}" y="${p.ok ? 0 : 10}" width="4" height="${p.ok ? 20 : 10}" rx="1" fill="${p.ok ? '#5AA9FF' : '#FF7A6B'}"><title>${fmtTime(p.ts)} — ${p.ok ? fmtMs(p.latency_ms) : 'başarısız'}</title></rect>`);
+  const failed = points.filter((p) => !p.ok).length;
+  return h`<svg width="${points.length * 5}" height="20" role="img" aria-label="Son ${points.length} kontrolün ${failed} tanesi başarısız">${bars}</svg>`;
+}
 const empty = (text) => h`<div class="empty">${text}</div>`;
 const pill = (act, value, current, label) => h`<button type="button" class="btn ${value === current ? 'on' : ''}" aria-pressed="${value === current}" data-act="${act}" data-value="${value}">${label}</button>`;
 
@@ -112,7 +121,7 @@ function barChart(buckets, parts, label) {
 }
 
 // ---------------------------------------------------------------- iskelet
-const NAV = [['', 'Genel Bakış'], ['hosts', 'Sunucular'], ['devices', 'Ağ Cihazları'], ['connections', 'Bağlantı Analizi'], ['alerts', 'Uyarılar'], ['users', 'Kullanıcılar', true], ['settings', 'Ayarlar', true], ['account', 'Hesabım']];
+const NAV = [['', 'Genel Bakış'], ['hosts', 'Sunucular'], ['devices', 'Ağ Cihazları'], ['connections', 'Bağlantı Analizi'], ['services', 'Servisler'], ['alerts', 'Uyarılar'], ['users', 'Kullanıcılar', true], ['settings', 'Ayarlar', true], ['account', 'Hesabım']];
 function shell(route, content) {
   const links = NAV.filter(([, , adminOnly]) => !adminOnly || isAdmin()).map(([id, label]) => h`<a class="nav ${route === id ? 'on' : ''}" href="#/${id}" ${route === id ? new Raw('aria-current="page"') : ''}><span>${label}</span>${id === 'alerts' && ui.openCrit ? h`<span class="count">${ui.openCrit}</span>` : ''}</a>`);
   const options = ui.companies.map((c) => h`<option value="${c.id}" ${String(c.id) === ui.company ? new Raw('selected') : ''}>${c.code} — ${c.name}</option>`);
@@ -170,6 +179,10 @@ const views = {
       <div class="card kpi"><div class="label">Bağlantı denemesi (24 sa)</div><div class="value">${nf.format(k.attempts_24h)}</div><div class="note">${nf.format(k.closed_24h)} tanesi kapalı porta</div></div>
     </section>
     <section class="card"><h2>Şirketler</h2><div class="row" style="margin-top:14px;gap:12px">${tiles.length ? tiles : empty(isAdmin() ? 'Henüz şirket yok. Ayarlar sayfasından ekleyin.' : 'Size atanmış şirket yok. Yöneticinizden erişim isteyin.')}</div></section>
+    ${d.checks.length ? h`<section class="card"><div class="wrap between"><h2>Servis durumu</h2><a class="small" href="#/services">Tümünü gör</a></div>
+      <div class="row" style="margin-top:14px;gap:12px">${d.checks.slice(0, 12).map((k) => h`<a class="tile" style="flex-basis:170px" href="#/services"><b>${k.name}</b>
+        <div class="small ${k.state === 'ok' ? 't-ok' : k.state === 'warn' ? 't-warn' : k.state === 'crit' ? 't-crit' : 'muted'}" style="margin-top:4px">${CHECK_STATE[k.state][1]}${k.state === 'ok' || k.state === 'warn' ? ` · ${fmtMs(k.latency_ms)}` : ''}</div>
+        <div class="small muted">${k.company_code}</div></a>`)}</div></section>` : ''}
     <div class="row top"><section class="card grow2"><div class="wrap between"><h2>Ağ trafiği · son 24 saat</h2>
         <div class="legend"><span><i style="background:#5AA9FF"></i>Gelen</span><span><i style="background:#F2B84B"></i>Giden (kesikli)</span></div></div>
         ${lineChart([{ color: '#5AA9FF', points: pts('rx') }, { color: '#F2B84B', dash: '7 5', points: pts('tx') }], { fmt: fmtBps, label: 'Son 24 saatte gelen ve giden ağ trafiği' })}</section>
@@ -302,7 +315,40 @@ const views = {
       <h2>Uyarı eşikleri</h2>
       <div class="row">${num('disk_warn', 'Disk uyarı (%)')}${num('disk_crit', 'Disk kritik (%)')}${num('cpu_warn', 'CPU uyarı (%)')}${num('mem_warn', 'Bellek uyarı (%)')}</div>
       <div class="row">${num('offline_seconds', 'Sunucu çevrimdışı sayılma süresi (sn)')}${num('device_offline_seconds', 'İzlenen cihaz çevrimdışı süresi (sn)')}${num('scan_ports', 'Port taraması eşiği (10 dk içinde port)')}${num('brute_fails', 'Parola saldırısı eşiği (10 dk içinde hata)')}</div>
+      <div class="row">${num('check_fail_count', 'Servis uyarısı için art arda başarısız kontrol')}${num('cert_warn_days', 'Sertifika uyarısı (kalan gün)')}</div>
       <div class="wrap"><button class="btn primary">Ayarları kaydet</button><button type="button" class="btn" data-act="test-notify">Test bildirimi gönder</button></div></form>`;
+  },
+
+  async services() {
+    const [d, hd] = await Promise.all([api(scoped('/api/checks')), canEdit() ? api(scoped('/api/hosts')) : { hosts: [] }]);
+    const n = (...states) => d.checks.filter((k) => states.includes(k.state)).length;
+    const certSoon = d.checks.filter((k) => k.cert_days !== null && k.cert_days <= 30 && k.enabled).length;
+    const rows = d.checks.map((k) => {
+      const st = CHECK_STATE[k.state];
+      const cert = k.cert_days === null ? h`<span class="muted">—</span>` : h`<span class="${k.cert_days <= 3 ? 't-crit' : k.cert_days <= 14 ? 't-warn' : ''}">${k.cert_days < 0 ? 'Süresi doldu' : `${Math.floor(k.cert_days)} gün`}</span>`;
+      return h`<tr><td><b>${k.name}</b><div class="mono muted" style="overflow-wrap:anywhere">${k.target}</div>${k.detail && k.state !== 'ok' && k.state !== 'off' ? h`<div class="small ${k.state === 'crit' ? 't-crit' : 't-warn'}">${k.detail}</div>` : ''}</td>
+        <td>${badge(st[0], st[1])}</td><td class="num">${k.state === 'off' || k.state === 'unknown' ? '—' : fmtMs(k.latency_ms)}</td>
+        <td class="num">${k.uptime_24h === null ? '—' : `%${k.uptime_24h.toLocaleString('tr-TR')}`}</td><td>${cert}</td><td>${historyStrip(k.history)}</td>
+        <td>${k.company_code}<div class="small muted">${k.hostname} · ${k.checked_at ? ago(d.now, k.checked_at) : 'henüz çalışmadı'}</div></td>
+        ${canEdit() ? h`<td><div class="wrap" style="flex-wrap:nowrap"><button type="button" class="btn" data-act="check-toggle" data-value="${k.id}" data-on="${k.enabled ? 0 : 1}">${k.enabled ? 'Durdur' : 'Başlat'}</button>
+          <button type="button" class="btn" data-act="check-delete" data-value="${k.id}" data-name="${k.name}">Sil</button></div></td>` : ''}</tr>`;
+    });
+    const form = !canEdit() ? '' : !hd.hosts.length ? h`<section class="card"><h2>Yeni kontrol</h2>${empty('Kontrol ekleyebilmek için önce bir sunucuya ajan kurulmalı.')}</section>` : h`<form class="card" data-form="check-new" style="display:flex;flex-direction:column;gap:12px"><h2>Yeni kontrol</h2>
+      <p class="small muted" style="margin:0">Kontrolü seçtiğiniz sunucudaki ajan kendi ağının içinden çalıştırır; panele yalnızca durum ve yanıt süresi gelir.</p>
+      <div class="row"><label class="field"><span>Ad</span><input type="text" name="name" required maxlength="80" placeholder="ERP uygulaması"></label>
+        <label class="field" style="flex:0 1 190px"><span>Tür</span><select name="type"><option value="http">HTTP / HTTPS adresi</option><option value="tcp">TCP portu</option></select></label>
+        <label class="field" style="flex:2 1 280px"><span>Hedef (adres veya sunucu:port)</span><input type="text" name="target" required maxlength="300" autocapitalize="none" placeholder="https://erp.sirket.local/ veya 10.0.0.5:5432"></label></div>
+      <div class="row"><label class="field"><span>Çalıştıracak sunucu</span><select name="host_id">${hd.hosts.map((x) => h`<option value="${x.id}">${x.company_code} — ${x.hostname}</option>`)}</select></label>
+        <label class="field" style="flex:0 1 220px"><span>Beklenen HTTP kodu</span><input type="number" name="expect_status" min="100" max="599" placeholder="200–399"></label>
+        <label class="field" style="flex:0 1 220px"><span>Yavaş eşiği (ms)</span><input type="number" name="slow_ms" min="1" placeholder="isteğe bağlı"></label></div>
+      <div class="wrap"><label class="check"><input type="checkbox" name="verify" checked>HTTPS sertifikasını doğrula</label><button class="btn primary">Kontrol ekle</button></div></form>`;
+    return h`<header class="head"><div><h1>Servisler</h1><p>Ajanların her raporda çalıştırdığı sağlık kontrolleri. Art arda başarısız olan kontrol kritik uyarı üretir; süresi yaklaşan sertifikalar ayrıca bildirilir.</p></div></header>
+    <section class="row" aria-label="Servis özeti">
+      <div class="card kpi"><div class="label">Çalışan</div><div class="value t-ok">${n('ok', 'warn')}<small> / ${n('ok', 'warn', 'crit')}</small></div><div class="note">${n('warn')} tanesi yavaş</div></div>
+      <div class="card kpi"><div class="label">Sorunlu</div><div class="value ${n('crit') ? 't-crit' : ''}">${n('crit')}</div><div class="note">${n('unknown', 'off')} kontrol beklemede veya kapalı</div></div>
+      <div class="card kpi"><div class="label">Sertifikası 30 gün içinde dolan</div><div class="value ${certSoon ? 't-warn' : ''}">${certSoon}</div><div class="note">Yalnızca doğrulanan HTTPS kontrolleri</div></div></section>
+    <section class="card"><h2>Kontroller</h2>${rows.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:${canEdit() ? 1080 : 900}px"><thead><tr><th>Servis</th><th>Durum</th><th class="num">Yanıt</th><th class="num">24 sa erişim</th><th>Sertifika</th><th>Son kontroller</th><th>Çalıştıran</th>${canEdit() ? h`<th>İşlem</th>` : ''}</tr></thead><tbody>${rows}</tbody></table></div>` : empty(canEdit() ? 'Henüz kontrol yok. Aşağıdan ekleyin.' : 'Henüz tanımlı kontrol yok.')}</section>
+    ${form}`;
   },
 
   async users() {
@@ -378,6 +424,8 @@ const actions = {
     if (!confirm(`${el.dataset.code} için yeni anahtar üretilsin mi? Eski anahtarı kullanan ajanlar rapor gönderemez.`)) return;
     ui.newToken = { code: el.dataset.code, token: (await api(`/api/companies/${v}/token`, {})).token };
   },
+  'check-toggle': async (v, el) => { await api(`/api/checks/${v}`, { enabled: el.dataset.on === '1' }); },
+  'check-delete': async (v, el) => { if (!confirm(`"${el.dataset.name}" kontrolü silinsin mi?`)) return false; await api(`/api/checks/${v}/delete`, {}); },
   'user-delete': async (v, el) => { if (!confirm(`${el.dataset.name} kullanıcısı silinsin mi?`)) return false; await api(`/api/users/${v}/delete`, {}); },
   'test-notify': async () => { const r = await api('/api/settings/test', {}); toast(`Test bildirimi gönderildi: ${r.sent.join(', ')}`); return false; },
 };
@@ -400,6 +448,7 @@ document.addEventListener('submit', async (ev) => {
       else { body.active = form.active.checked; await api(`/api/users/${form.dataset.id}`, body); toast('Kullanıcı güncellendi.'); }
       if (form.dataset.id === String(ui.me.id)) ui.me = null;
     }
+    if (form.dataset.form === 'check-new') { data.verify = form.verify.checked; data.host_id = Number(data.host_id); await api('/api/checks', data); toast('Kontrol eklendi; ilk sonuç bir sonraki ajan raporuyla gelir.'); }
     if (form.dataset.form === 'password') { await api('/api/me/password', data); toast('Parola değiştirildi.'); }
     if (form.dataset.form === 'company-new') { ui.newToken = await api('/api/companies', data); }
     if (form.dataset.form === 'company-chat') { await api(`/api/companies/${form.dataset.id}`, data); toast('Kaydedildi.'); }

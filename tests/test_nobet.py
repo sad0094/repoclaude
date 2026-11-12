@@ -1,8 +1,10 @@
 """Uçtan uca ve birim testleri: python3 -m unittest discover -s tests -v"""
 import json
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -277,6 +279,86 @@ class ManagerTest(unittest.TestCase):
         self.assertTrue(check_password("eski-parola", user["password_hash"]))
         self.assertEqual(db.get("admin_hash"), "")
 
+    # ---------------------------------------------------------------- servis sağlık kontrolleri
+    def add_check(self, host_id, **fields):
+        body = {"host_id": host_id, "name": "ERP", "type": "http", "target": "https://erp.ic/saglik"}
+        body.update(fields)
+        return self.call("/api/checks", body)["id"]
+
+    def test_checks_are_delivered_to_agent_and_drive_alerts(self):
+        first = self.call("/api/agent/report", report("xxxx-srv"), token=self.xxxx["token"])
+        self.assertEqual(first["checks"], [])
+        host_id = self.call("/api/hosts")["hosts"][0]["id"]
+        cid = self.add_check(host_id, slow_ms=500)
+        sent = self.call("/api/agent/report", report("xxxx-srv"), token=self.xxxx["token"])["checks"]
+        self.assertEqual(sent, [{"id": cid, "type": "http", "target": "https://erp.ic/saglik",
+                                 "expect_status": None, "verify": True, "timeout": 5}])
+        check = lambda: self.call("/api/checks")["checks"][0]
+        self.assertEqual(check()["state"], "unknown")
+
+        def result(**r):
+            self.call("/api/agent/report", report("xxxx-srv", checks=[dict(id=cid, **r)]), token=self.xxxx["token"])
+        result(ok=True, latency_ms=40, status_code=200, cert_days=90)
+        self.assertEqual((check()["state"], check()["uptime_24h"]), ("ok", 100.0))
+        result(ok=True, latency_ms=900, status_code=200, cert_days=90)
+        self.assertEqual(check()["state"], "warn")                     # yavaş
+        result(ok=False, latency_ms=5000, error="Zaman aşımı")
+        self.assertEqual(check()["state"], "crit")
+        self.assertNotIn(f"check:{cid}", self.open_alerts())           # tek hata uyarı üretmez
+        result(ok=False, latency_ms=5000, error="Zaman aşımı")
+        alert = self.open_alerts()[f"check:{cid}"]
+        self.assertEqual(alert["severity"], "crit")
+        self.assertIn("Zaman aşımı", alert["detail"])
+        self.assertIn("Servis yanıt vermiyor: ERP", self.messages()[-1]["text"])
+        self.assertEqual(check()["uptime_24h"], 50.0)
+        result(ok=True, latency_ms=30, status_code=200, cert_days=10)
+        alerts = self.open_alerts()
+        self.assertNotIn(f"check:{cid}", alerts)
+        self.assertEqual(alerts[f"cert:{cid}"]["severity"], "warn")    # sertifika 10 gün
+        result(ok=True, latency_ms=30, status_code=200, cert_days=2)
+        self.assertEqual(self.open_alerts()[f"cert:{cid}"]["severity"], "crit")
+        self.call(f"/api/checks/{cid}/delete", {})
+        self.assertEqual(self.open_alerts(), {})
+        self.assertEqual(self.call("/api/checks")["checks"], [])
+
+    def test_check_results_cannot_cross_hosts_or_companies(self):
+        self.call("/api/agent/report", report("xxxx-srv"), token=self.xxxx["token"])
+        self.call("/api/agent/report", report("yyy-srv"), token=self.yyy["token"])
+        hosts = {h["hostname"]: h["id"] for h in self.call("/api/hosts")["hosts"]}
+        cid = self.add_check(hosts["xxxx-srv"])
+        forged = report("yyy-srv", checks=[{"id": cid, "ok": False, "error": "sahte"}] * 3)
+        self.call("/api/agent/report", forged, token=self.yyy["token"])
+        self.assertEqual(self.call("/api/checks")["checks"][0]["state"], "unknown")
+        self.assertEqual(self.open_alerts(), {})
+        self.assertEqual(self.call("/api/agent/report", report("yyy-srv"), token=self.yyy["token"])["checks"], [])
+
+    def test_check_validation_and_permissions(self):
+        self.call("/api/agent/report", report("xxxx-srv"), token=self.xxxx["token"])
+        self.call("/api/agent/report", report("yyy-srv"), token=self.yyy["token"])
+        hosts = {h["hostname"]: h["id"] for h in self.call("/api/hosts")["hosts"]}
+        bad = [{"type": "icmp"}, {"target": "ftp://x"}, {"target": "https://kullanici:parola@x/"},
+               {"type": "tcp", "target": "10.0.0.5"}, {"type": "tcp", "target": "10.0.0.5:99999"},
+               {"type": "tcp", "target": "a b:22"}, {"name": ""}, {"expect_status": 999}, {"host_id": 9999}]
+        for fields in bad:
+            body = {"host_id": hosts["xxxx-srv"], "name": "x", "type": "http", "target": "https://x/"}
+            body.update(fields)
+            self.assertIn(self.status("/api/checks", body), (400, 404), fields)
+        tcp = self.add_check(hosts["xxxx-srv"], name="PostgreSQL", type="tcp", target="10.0.0.5:5432")
+        self.make_user("yyy.operator", "operator", [self.yyy])
+        self.make_user("izleyici", "viewer", all_companies=True)
+        self.as_user("yyy.operator")
+        self.assertEqual(self.call("/api/checks")["checks"], [])
+        self.assertEqual(self.status("/api/checks", {"host_id": hosts["xxxx-srv"], "name": "x", "type": "tcp",
+                                                     "target": "10.0.0.1:22"}), 404)
+        self.assertEqual(self.status(f"/api/checks/{tcp}", {"enabled": False}), 404)
+        self.assertEqual(self.status(f"/api/checks/{tcp}/delete", {}), 404)
+        own = self.add_check(hosts["yyy-srv"], name="Site", target="http://10.1.0.5/")
+        self.call(f"/api/checks/{own}", {"enabled": False})
+        self.assertEqual(self.call("/api/checks")["checks"][0]["state"], "off")
+        self.as_user("izleyici")
+        self.assertEqual(len(self.call("/api/checks")["checks"]), 2)
+        self.assertEqual(self.status(f"/api/checks/{tcp}/delete", {}), 403)
+
     # ---------------------------------------------------------------- uyarılar ve Telegram
     def test_critical_disk_alert_notifies_and_resolves(self):
         self.call("/api/agent/report", report(disk=95), token=self.xxxx["token"])
@@ -459,6 +541,76 @@ class AgentTest(unittest.TestCase):
         mem = agent.read_meminfo("MemTotal: 1000 kB\nMemFree: 100 kB\nMemAvailable: 250 kB\n")
         self.assertEqual((mem["mem_total"], mem["mem_used"], mem["mem_pct"]), (1024000, 768000, 75.0))
         self.assertEqual(agent.read_cpu_times("cpu  10 0 10 70 10 0 0 0 0 0\n"), (80, 100))
+
+    def test_run_check_against_local_services(self):
+        class Health(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200 if self.path == "/ok" else 503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+        srv = HTTPServer(("127.0.0.1", 0), Health)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_port
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        closed_port = closed.getsockname()[1]
+        closed.close()
+        try:
+            results = agent.run_checks([
+                {"id": 1, "type": "tcp", "target": f"127.0.0.1:{port}"},
+                {"id": 2, "type": "tcp", "target": f"127.0.0.1:{closed_port}"},
+                {"id": 3, "type": "http", "target": f"http://127.0.0.1:{port}/ok"},
+                {"id": 4, "type": "http", "target": f"http://127.0.0.1:{port}/hata"},
+                {"id": 5, "type": "http", "target": f"http://127.0.0.1:{port}/hata", "expect_status": 503},
+                {"id": 6, "type": "ping", "target": "x"}, "bozuk"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        by_id = {r["id"]: r for r in results}
+        self.assertEqual([by_id[i]["ok"] for i in range(1, 7)], [True, False, True, False, True, False])
+        self.assertEqual(by_id[2]["error"], "Bağlantı reddedildi")
+        self.assertEqual((by_id[4]["status_code"], by_id[4]["error"]), (503, "HTTP 503"))
+        self.assertTrue(all("latency_ms" in r for r in results))
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl gerekli")
+    def test_https_check_reports_certificate_expiry(self):
+        import ssl
+        with tempfile.TemporaryDirectory() as tmp:
+            cert, key = os.path.join(tmp, "c.pem"), os.path.join(tmp, "k.pem")
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                            "-days", "20", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"],
+                           check=True, capture_output=True)
+
+            class Ok(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+                def log_message(self, *args):
+                    pass
+            srv = HTTPServer(("127.0.0.1", 0), Ok)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            url = f"https://localhost:{srv.server_port}/"
+            try:
+                untrusted = agent.run_check({"id": 1, "type": "http", "target": url})
+                unverified = agent.run_check({"id": 2, "type": "http", "target": url, "verify": False})
+                trusted = agent.run_check({"id": 3, "type": "http", "target": url, "_cafile": cert})
+            finally:
+                srv.shutdown()
+                srv.server_close()
+        self.assertFalse(untrusted["ok"])
+        self.assertIn("Sertifika doğrulanamadı", untrusted["error"])
+        self.assertTrue(unverified["ok"])
+        self.assertNotIn("cert_days", unverified)
+        self.assertTrue(trusted["ok"])
+        self.assertTrue(19 <= trusted["cert_days"] <= 20, trusted)
 
     def test_monitor_ignores_own_addresses(self):
         mon = agent.ConnectionMonitor.__new__(agent.ConnectionMonitor)
