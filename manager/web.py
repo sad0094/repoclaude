@@ -82,6 +82,37 @@ class App:
     def can_access(user, company_id):
         return user["companies"] is None or company_id in user["companies"]
 
+    # ------------------------------------------------------------------ işlem günlüğü
+    def audit(self, actor, action, target="", detail="", company_id=None, ip=""):
+        """Paneldeki bir işlemi kaydeder. Kayıtlar API üzerinden değiştirilemez veya silinemez.
+        Parola, anahtar gibi gizli değerler asla detaya yazılmaz."""
+        clean = lambda v, n: "".join(ch for ch in str(v) if ch.isprintable())[:n]
+        actor = actor or {}
+        self.db.write(
+            "INSERT INTO audit_log(ts,user_id,username,role,company_id,action,target,detail,ip) VALUES(?,?,?,?,?,?,?,?,?)",
+            (time.time(), actor.get("id"), clean(actor.get("username", "-"), 64) or "-", actor.get("role"),
+             company_id, action, clean(target, 160), clean(detail, 400), clean(ip, 64)))
+
+    def audit_log(self, query):
+        clause, args = "", []
+        if query.get("company", "").isdigit():
+            clause += " AND a.company_id=?"
+            args.append(int(query["company"]))
+        if query.get("area"):
+            clause += " AND a.action LIKE ?"
+            args.append(query["area"].replace("%", "").replace("_", "")[:20] + ".%")
+        if query.get("q"):
+            like = "%" + query["q"][:80].replace("\\", "").replace("%", "\\%").replace("_", "\\_") + "%"
+            clause += " AND (a.username LIKE ? ESCAPE '\\' OR a.target LIKE ? ESCAPE '\\' OR a.detail LIKE ? ESCAPE '\\' OR a.ip LIKE ? ESCAPE '\\')"
+            args += [like] * 4
+        if query.get("before", "").isdigit():
+            clause += " AND a.id<?"
+            args.append(int(query["before"]))
+        rows = self.db.q(
+            "SELECT a.*, c.code company_code FROM audit_log a LEFT JOIN companies c ON c.id=a.company_id "
+            f"WHERE 1=1{clause} ORDER BY a.id DESC LIMIT 101", args)
+        return {"entries": rows[:100], "more": len(rows) > 100}
+
     # ------------------------------------------------------------------ kullanıcı yönetimi
     def users(self):
         rows = self.db.q("SELECT id, username, role, all_companies, active, created_at, last_login "
@@ -137,13 +168,31 @@ class App:
             self.db.write("UPDATE users SET password_hash=? WHERE id=?", (hash_password(str(body["password"])), user_id))
             self.db.write("DELETE FROM sessions WHERE user_id=?", (user_id,))
         self.db.write("UPDATE users SET role=?, active=? WHERE id=?", (role, active, user_id))
+        before = None if target["role"] == "admin" or target["all_companies"] else self.db.user_company_ids(user_id)
         if role == "admin":
             self.db.set_user_companies(user_id, None)
         elif "companies" in body or "all_companies" in body or target["role"] == "admin":
             self.db.set_user_companies(user_id, self._company_ids(body))
         if not active:
             self.db.write("DELETE FROM sessions WHERE user_id=?", (user_id,))
-        return {"ok": True}
+        now = self.db.one("SELECT role, all_companies FROM users WHERE id=?", (user_id,))
+        after = None if now["role"] == "admin" or now["all_companies"] else self.db.user_company_ids(user_id)
+        changes = []
+        if role != target["role"]:
+            changes.append(f"rol: {target['role']} -> {role}")
+        if bool(active) != bool(target["active"]):
+            changes.append("etkinleştirildi" if active else "devre dışı bırakıldı")
+        if before != after:
+            changes.append(f"şirketler: {self._company_codes(before)} -> {self._company_codes(after)}")
+        if body.get("password"):
+            changes.append("parola sıfırlandı")
+        return {"ok": True, "username": target["username"], "changes": changes}
+
+    def _company_codes(self, ids):
+        if ids is None:
+            return "tümü"
+        codes = {c["id"]: c["code"] for c in self.db.q("SELECT id, code FROM companies")}
+        return ", ".join(codes.get(i, "?") for i in ids) or "yok"
 
     def delete_user(self, user_id, actor):
         target = self.db.one("SELECT * FROM users WHERE id=?", (user_id,))
@@ -156,7 +205,7 @@ class App:
             c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
             c.execute("DELETE FROM user_companies WHERE user_id=?", (user_id,))
             c.execute("DELETE FROM users WHERE id=?", (user_id,))
-        return {"ok": True}
+        return {"ok": True, "username": target["username"]}
 
     def _guard_last_admin(self, target, new_role, new_active):
         """Sistemde her zaman en az bir etkin yönetici kalmalı."""
@@ -461,7 +510,11 @@ class App:
         out["last_notify_error"] = self.notifier.last_error
         return out
 
+    SECRET_SETTINGS = ("telegram_bot_token", "webhook_url")   # günlükte değerleri gösterilmez
+
     def save_settings(self, body):
+        """Ayarları kaydeder; (görünüm, değişiklik listesi) döndürür."""
+        changes = []
         for key, value in body.items():
             if key not in DEFAULTS:
                 continue
@@ -477,8 +530,11 @@ class App:
                 continue  # boş bırakılırsa mevcut token korunur
             if key in ("webhook_url", "panel_url") and value and not value.startswith(("http://", "https://")):
                 raise HttpError(400, f"{key} http:// veya https:// ile başlamalı.")
-            self.db.set(key, value)
-        return self.settings_view()
+            old = self.db.get(key)
+            if value != old:
+                changes.append(f"{key} değiştirildi" if key in self.SECRET_SETTINGS else f"{key}: {old or '(boş)'} -> {value or '(boş)'}")
+                self.db.set(key, value)
+        return self.settings_view(), changes
 
 
 def make_handler(app):
@@ -522,6 +578,13 @@ def make_handler(app):
             if not isinstance(data, dict):
                 raise HttpError(400, "JSON nesnesi bekleniyor.")
             return data
+
+        def _client_ip(self):
+            # Ters vekil arkasında gerçek istemci adresi, vekilin eklediği son X-Forwarded-For değeridir.
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            if self.server.trust_proxy and forwarded:
+                return forwarded.split(",")[-1].strip()[:64]
+            return self.client_address[0]
 
         def _session_token(self):
             for part in self.headers.get("Cookie", "").split(";"):
@@ -582,12 +645,21 @@ def make_handler(app):
                                         "checks": app.engine.agent_checks(company["id"], host_id)})
             if (method, path) == ("POST", "/api/login"):
                 body = self._body()
-                token = app.login(str(body.get("username", "")), str(body.get("password", "")),
-                                  self.client_address[0])
+                name, ip = str(body.get("username", "")).strip().lower(), self._client_ip()
+                try:
+                    token = app.login(name, str(body.get("password", "")), ip)
+                except HttpError as err:
+                    if err.status == 401:
+                        app.audit({"username": name or "-"}, "auth.login_failed", ip=ip)
+                    raise
+                app.audit(app.session_user(token), "auth.login", ip=ip)
                 return self._send(200, {"ok": True}, headers=[self._cookie(token, SESSION_TTL)])
             if (method, path) == ("POST", "/api/logout"):
                 token = self._session_token()
                 if token:
+                    who = app.session_user(token)
+                    if who:
+                        app.audit(who, "auth.logout", ip=self._client_ip())
                     app.db.write("DELETE FROM sessions WHERE token_hash=?", (sha256(token),))
                 return self._send(200, {"ok": True}, headers=[self._cookie("", 0)])
 
@@ -603,10 +675,14 @@ def make_handler(app):
                     raise HttpError(403, "Bu işlem için yönetici yetkisi gerekli.")
 
             def owned(table, row_id):
-                """Kayıt kullanıcının yetkili olduğu bir şirkete ait değilse 404 (varlığını da sızdırma)."""
-                row = app.db.one(f"SELECT company_id FROM {table} WHERE id=?", (row_id,))
+                """Kaydı döndürür; kullanıcının yetkili olduğu bir şirkete ait değilse 404 (varlığını da sızdırma)."""
+                row = app.db.one(f"SELECT * FROM {table} WHERE id=?", (row_id,))
                 if not row or not app.can_access(user, row["company_id"]):
                     raise HttpError(404, "Bulunamadı.")
+                return row
+
+            def log(action, target="", detail="", company_id=None):
+                app.audit(user, action, target, detail, company_id, self._client_ip())
 
             if method == "GET":
                 if resource == "me":
@@ -635,66 +711,107 @@ def make_handler(app):
                 if resource == "users":
                     admin_only()
                     return self._send(200, {"users": app.users()})
+                if resource == "audit":
+                    admin_only()
+                    return self._send(200, app.audit_log(query))
                 raise HttpError(404, "Bulunamadı.")
 
             if method != "POST":
                 raise HttpError(405, "Desteklenmeyen yöntem.")
             body = self._body()
             if resource == "me" and action == "password":
-                return self._send(200, app.change_own_password(user, body, self._session_token()))
+                result = app.change_own_password(user, body, self._session_token())
+                log("auth.password")
+                return self._send(200, result)
             if user["role"] == "viewer":
                 raise HttpError(403, "İzleyici rolü değişiklik yapamaz.")
 
             # --- operatör ve yönetici: kendi şirketlerindeki uyarı ve cihazlar ---
             if resource == "alerts" and rid and action == "ack":
-                owned("alerts", rid)
-                app.db.write("UPDATE alerts SET acked_at=?, acked_by=? WHERE id=? AND acked_at IS NULL",
-                             (time.time(), user["username"], rid))
+                alert = owned("alerts", rid)
+                if not alert["acked_at"]:
+                    app.db.write("UPDATE alerts SET acked_at=?, acked_by=? WHERE id=? AND acked_at IS NULL",
+                                 (time.time(), user["username"], rid))
+                    log("alert.ack", alert["title"], company_id=alert["company_id"])
                 return self._send(200, {"ok": True})
             if resource == "devices" and rid:
-                owned("devices", rid)
+                device = owned("devices", rid)
+                name = f"{device['ip']} ({device['mac']})"
                 if "watched" in body:
                     app.db.write("UPDATE devices SET watched=? WHERE id=?", (1 if body["watched"] else 0, rid))
+                    log("device.watch", name, "izleme açıldı" if body["watched"] else "izleme kapatıldı", device["company_id"])
                 if "label" in body:
-                    app.db.write("UPDATE devices SET label=? WHERE id=?", (str(body["label"]).strip()[:80], rid))
+                    label = str(body["label"]).strip()[:80]
+                    app.db.write("UPDATE devices SET label=? WHERE id=?", (label, rid))
+                    log("device.label", name, f"ad: {label or '(silindi)'}", device["company_id"])
                 return self._send(200, {"ok": True})
 
             if resource == "checks" and rid and action == "delete":
-                owned("checks", rid)
-                return self._send(200, app.delete_check(rid))
+                check = owned("checks", rid)
+                result = app.delete_check(rid)
+                log("check.delete", check["name"], check["target"], check["company_id"])
+                return self._send(200, result)
             if resource == "checks" and rid:
-                owned("checks", rid)
-                return self._send(200, app.update_check(rid, body))
+                check = owned("checks", rid)
+                result = app.update_check(rid, body)
+                after = app.db.one("SELECT * FROM checks WHERE id=?", (rid,))
+                diff = [f"{k}: {check[k]} -> {after[k]}" for k in
+                        ("name", "target", "expect_status", "slow_ms", "verify", "enabled") if check[k] != after[k]]
+                if diff:
+                    log("check.update", after["name"], "; ".join(diff), check["company_id"])
+                return self._send(200, result)
             if resource == "checks":
                 try:
                     host_id = int(body.get("host_id"))
                 except (TypeError, ValueError):
                     raise HttpError(400, "Kontrolü çalıştıracak sunucuyu seçin.")
                 owned("hosts", host_id)
-                host = app.db.one("SELECT id, company_id FROM hosts WHERE id=?", (host_id,))
-                return self._send(201, app.create_check(body, host))
+                host = app.db.one("SELECT id, company_id, hostname FROM hosts WHERE id=?", (host_id,))
+                result = app.create_check(body, host)
+                created = app.db.one("SELECT name, type, target FROM checks WHERE id=?", (result["id"],))
+                log("check.create", created["name"], f"{created['type']} {created['target']} · {host['hostname']}",
+                    host["company_id"])
+                return self._send(201, result)
 
             # --- yalnızca yönetici ---
             admin_only()
             if resource == "users" and rid and action == "delete":
-                return self._send(200, app.delete_user(rid, user))
+                result = app.delete_user(rid, user)
+                log("user.delete", result["username"])
+                return self._send(200, {"ok": True})
             if resource == "users" and rid:
-                return self._send(200, app.update_user(rid, body, user))
+                result = app.update_user(rid, body, user)
+                if result["changes"]:
+                    log("user.update", result["username"], "; ".join(result["changes"]))
+                return self._send(200, {"ok": True})
             if resource == "users":
-                return self._send(201, app.create_user(body))
-            if resource == "companies" and rid and action == "token":
-                if not app.db.one("SELECT 1 FROM companies WHERE id=?", (rid,)):
-                    raise HttpError(404, "Şirket bulunamadı.")
-                return self._send(200, {"token": app.db.rotate_token(rid)})
+                result = app.create_user(body)
+                made = [u for u in app.users() if u["id"] == result["id"]][0]
+                scope = None if made["role"] == "admin" or made["all_companies"] else made["companies"]
+                log("user.create", made["username"], f"rol: {made['role']}; şirketler: {app._company_codes(scope)}")
+                return self._send(201, result)
             if resource == "companies" and rid:
+                company = app.db.one("SELECT * FROM companies WHERE id=?", (rid,))
+                if not company:
+                    raise HttpError(404, "Şirket bulunamadı.")
+                if action == "token":
+                    token = app.db.rotate_token(rid)
+                    log("company.token", company["code"], "ajan anahtarı yenilendi", rid)
+                    return self._send(200, {"token": token})
                 if "telegram_chat_id" in body:
-                    app.db.write("UPDATE companies SET telegram_chat_id=? WHERE id=?",
-                                 (str(body["telegram_chat_id"]).strip()[:64], rid))
-                if str(body.get("name", "")).strip():
-                    app.db.write("UPDATE companies SET name=? WHERE id=?", (str(body["name"]).strip()[:120], rid))
+                    chat = str(body["telegram_chat_id"]).strip()[:64]
+                    if chat != company["telegram_chat_id"]:
+                        app.db.write("UPDATE companies SET telegram_chat_id=? WHERE id=?", (chat, rid))
+                        log("company.update", company["code"], f"Telegram sohbeti: {chat or '(varsayılan)'}", rid)
+                name = str(body.get("name", "")).strip()[:120]
+                if name and name != company["name"]:
+                    app.db.write("UPDATE companies SET name=? WHERE id=?", (name, rid))
+                    log("company.update", company["code"], f"ad: {company['name']} -> {name}", rid)
                 return self._send(200, {"ok": True})
             if resource == "companies":
-                return self._send(201, app.create_company(body))
+                result = app.create_company(body)
+                log("company.create", result["code"], result["name"], result["id"])
+                return self._send(201, result)
             if resource == "settings" and action == "test":
                 try:
                     sent = app.notifier.deliver({
@@ -704,9 +821,13 @@ def make_handler(app):
                     raise HttpError(502, f"Gönderilemedi: {err}")
                 if not sent:
                     raise HttpError(400, "Yapılandırılmış bildirim kanalı yok.")
+                log("settings.test", "bildirim", ", ".join(sent))
                 return self._send(200, {"ok": True, "sent": sent})
             if resource == "settings":
-                return self._send(200, app.save_settings(body))
+                view, changes = app.save_settings(body)
+                for change in changes:
+                    log("settings.update", change.split(":")[0].split(" ")[0], change)
+                return self._send(200, view)
             raise HttpError(404, "Bulunamadı.")
 
         def do_GET(self):
@@ -718,8 +839,9 @@ def make_handler(app):
     return Handler
 
 
-def make_server(app, host, port, cert=None, key=None):
+def make_server(app, host, port, cert=None, key=None, trust_proxy=False):
     server = ThreadingHTTPServer((host, port), make_handler(app))
+    server.trust_proxy = trust_proxy
     server.daemon_threads = True
     server.is_tls = False
     if cert:

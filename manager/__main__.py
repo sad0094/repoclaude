@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--db", default=os.environ.get("NOBET_DB", "data/nobet.db"))
     ap.add_argument("--cert", help="TLS sertifikası (PEM)")
     ap.add_argument("--key", help="TLS özel anahtarı (PEM)")
+    ap.add_argument("--trust-proxy", action="store_true",
+                    help="istemci adresini X-Forwarded-For başlığından al (yalnızca ters vekil arkasında)")
     ap.add_argument("--set-password", action="store_true", help="bir kullanıcının parolasını değiştir ve çık")
     ap.add_argument("--user", default="admin", help="--set-password için kullanıcı adı (varsayılan: admin)")
     args = ap.parse_args()
@@ -64,7 +66,7 @@ def main():
 
     notifier.start()
     threading.Thread(target=tick_loop, args=(engine,), daemon=True, name="tick").start()
-    server = make_server(app, args.host, args.port, args.cert, args.key)
+    server = make_server(app, args.host, args.port, args.cert, args.key, args.trust_proxy)
     scheme = "https" if args.cert else "http"
     print(f"Nöbet Manager {scheme}://{args.host}:{args.port} adresinde çalışıyor (veritabanı: {args.db})", flush=True)
     if not args.cert:

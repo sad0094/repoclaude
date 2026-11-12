@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -278,6 +279,70 @@ class ManagerTest(unittest.TestCase):
         from manager.db import check_password
         self.assertTrue(check_password("eski-parola", user["password_hash"]))
         self.assertEqual(db.get("admin_hash"), "")
+
+    # ---------------------------------------------------------------- işlem günlüğü
+    def audit(self, **params):
+        query = urllib.parse.urlencode(params)
+        return self.call("/api/audit" + ("?" + query if query else ""))["entries"]
+
+    def test_audit_log_records_actions_without_secrets(self):
+        self.seed_two_companies()
+        alert = [a for a in self.call("/api/alerts")["alerts"] if a["key"] == "disk:/" and a["company_code"] == "YYY"][0]
+        device = [d for d in self.call("/api/devices")["devices"] if d["company_code"] == "YYY"][0]
+        host = [h for h in self.call("/api/hosts")["hosts"] if h["company_code"] == "YYY"][0]
+        uid = self.make_user("yyy.operator", "operator", [self.yyy])
+        self.call(f"/api/users/{uid}", {"role": "viewer", "companies": [self.xxxx["id"]], "password": "yepyeni-parola-1"})
+        self.call(f"/api/users/{uid}", {"role": "operator", "companies": [self.yyy["id"]], "password": "parola-12345"})
+        self.call("/api/settings", {"telegram_bot_token": "999:GIZLI", "webhook_url": "https://hooks.example/GIZLI-YOL",
+                                    "disk_crit": "95", "disk_warn": "80"})
+        self.call(f"/api/companies/{self.yyy['id']}/token", {})
+        self.status("/api/login", {"username": "yyy.operator", "password": "yanlis-parola"}, cookie=False)
+        admin_cookie = self.cookie
+        self.as_user("yyy.operator")
+        self.call(f"/api/alerts/{alert['id']}/ack", {})
+        self.call(f"/api/alerts/{alert['id']}/ack", {})          # ikinci kez: yeni kayıt oluşmaz
+        self.call(f"/api/devices/{device['id']}", {"watched": True, "label": "Ana yönlendirici"})
+        cid = self.add_check(host["id"], name="Site", target="http://10.1.0.5/")
+        self.call(f"/api/checks/{cid}", {"enabled": False})
+        self.call(f"/api/checks/{cid}/delete", {})
+        self.assertEqual(self.status("/api/audit"), 403)         # günlük yalnızca yöneticiye açık
+        self.cookie = admin_cookie
+
+        entries = self.audit()
+        by_action = {}
+        for e in entries:
+            by_action.setdefault(e["action"], []).append(e)
+        for action in ("auth.login", "auth.login_failed", "user.create", "user.update", "settings.update",
+                       "company.create", "company.token", "alert.ack", "device.watch", "device.label",
+                       "check.create", "check.update", "check.delete"):
+            self.assertIn(action, by_action, action)
+        self.assertEqual(len(by_action["alert.ack"]), 1)
+        ack = by_action["alert.ack"][0]
+        self.assertEqual((ack["username"], ack["role"], ack["company_code"], ack["ip"]),
+                         ("yyy.operator", "operator", "YYY", "127.0.0.1"))
+        self.assertIn("Disk doluluğu", ack["target"])
+        self.assertEqual(by_action["auth.login_failed"][0]["username"], "yyy.operator")
+        self.assertIn("rol: operator -> viewer", by_action["user.update"][-1]["detail"])
+        self.assertIn("şirketler: YYY -> XXXX", by_action["user.update"][-1]["detail"])
+        settings = {e["detail"] for e in by_action["settings.update"]}
+        self.assertIn("disk_crit: 90 -> 95", settings)
+        self.assertEqual(len(settings), 3)                       # değişmeyen disk_warn kaydedilmez
+        # Gizli değerler ve parolalar hiçbir kayıtta geçmez.
+        dump = json.dumps(entries, ensure_ascii=False)
+        for secret in ("GIZLI", "parola-12345", "yepyeni-parola-1", "yanlis-parola", "nbt_"):
+            self.assertNotIn(secret, dump)
+        # Filtreler ve sayfalama
+        self.assertEqual({e["action"].split(".")[0] for e in self.audit(area="check")}, {"check"})
+        self.assertTrue(all(e["company_code"] == "YYY" for e in self.audit(company=self.yyy["id"])))
+        self.assertEqual({e["action"] for e in self.audit(q="yönlendirici")}, {"device.label"})
+        # "%" joker değil, düz karakter olarak aranır: yalnızca içinde % geçen kayıt döner.
+        self.assertEqual([e["action"] for e in self.audit(q="%95")], ["alert.ack"])
+        self.assertEqual({e["action"] for e in self.audit(q="_")}, {"settings.update"})   # yalnızca adında _ geçenler
+        older = self.audit(before=entries[2]["id"])
+        self.assertEqual(older[0]["id"], entries[3]["id"])
+        # Günlüğü değiştiren veya silen bir uç nokta yok.
+        self.assertEqual(self.status("/api/audit", {}), 404)
+        self.assertEqual(self.status(f"/api/audit/{entries[0]['id']}/delete", {}), 404)
 
     # ---------------------------------------------------------------- servis sağlık kontrolleri
     def add_check(self, host_id, **fields):

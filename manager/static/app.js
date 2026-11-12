@@ -11,7 +11,7 @@ function h(strings, ...vals) {
 }
 const app = document.getElementById('app');
 const ui = { me: null, company: localStorage.getItem('nobet.company') || '', companies: [], openCrit: 0,
-  alertSev: 'all', alertState: 'open', devStatus: 'all', devQuery: '', hostIssues: false, hours: 24, newToken: null };
+  auditArea: '', auditQuery: '', auditPages: [], alertSev: 'all', alertState: 'open', devStatus: 'all', devQuery: '', hostIssues: false, hours: 24, newToken: null };
 let timer = null;
 
 // ---------------------------------------------------------------- yardımcılar
@@ -61,6 +61,12 @@ const SEV = { crit: 'Kritik', warn: 'Uyarı', info: 'Bilgi' };
 const ROLE = { admin: 'Yönetici', operator: 'Operatör', viewer: 'İzleyici' };
 const canEdit = () => ui.me && ui.me.role !== 'viewer';
 const isAdmin = () => ui.me && ui.me.role === 'admin';
+const AUDIT = { 'auth.login': ['Giriş', 'ok'], 'auth.login_failed': ['Başarısız giriş', 'down'], 'auth.logout': ['Çıkış', 'info'], 'auth.password': ['Parola değişikliği', 'warn'],
+  'alert.ack': ['Uyarı onayı', 'info'], 'device.watch': ['Cihaz izleme', 'info'], 'device.label': ['Cihaz adlandırma', 'info'],
+  'check.create': ['Kontrol eklendi', 'info'], 'check.update': ['Kontrol değişti', 'info'], 'check.delete': ['Kontrol silindi', 'warn'],
+  'user.create': ['Kullanıcı eklendi', 'warn'], 'user.update': ['Kullanıcı değişti', 'warn'], 'user.delete': ['Kullanıcı silindi', 'warn'],
+  'company.create': ['Şirket eklendi', 'warn'], 'company.update': ['Şirket değişti', 'warn'], 'company.token': ['Anahtar yenilendi', 'warn'],
+  'settings.update': ['Ayar değişti', 'warn'], 'settings.test': ['Test bildirimi', 'info'] };
 const STATUS = { ok: 'Sağlıklı', warn: 'Uyarı', crit: 'Kritik', down: 'Çevrimdışı' };
 const PORTS = { 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS', 80: 'HTTP', 110: 'POP3', 135: 'RPC', 139: 'NetBIOS', 143: 'IMAP',
   443: 'HTTPS', 445: 'SMB', 587: 'SMTP', 993: 'IMAPS', 1433: 'MSSQL', 1521: 'Oracle', 3306: 'MySQL', 3389: 'RDP', 5432: 'PostgreSQL',
@@ -121,7 +127,7 @@ function barChart(buckets, parts, label) {
 }
 
 // ---------------------------------------------------------------- iskelet
-const NAV = [['', 'Genel Bakış'], ['hosts', 'Sunucular'], ['devices', 'Ağ Cihazları'], ['connections', 'Bağlantı Analizi'], ['services', 'Servisler'], ['alerts', 'Uyarılar'], ['users', 'Kullanıcılar', true], ['settings', 'Ayarlar', true], ['account', 'Hesabım']];
+const NAV = [['', 'Genel Bakış'], ['hosts', 'Sunucular'], ['devices', 'Ağ Cihazları'], ['connections', 'Bağlantı Analizi'], ['services', 'Servisler'], ['alerts', 'Uyarılar'], ['users', 'Kullanıcılar', true], ['audit', 'İşlem Günlüğü', true], ['settings', 'Ayarlar', true], ['account', 'Hesabım']];
 function shell(route, content) {
   const links = NAV.filter(([, , adminOnly]) => !adminOnly || isAdmin()).map(([id, label]) => h`<a class="nav ${route === id ? 'on' : ''}" href="#/${id}" ${route === id ? new Raw('aria-current="page"') : ''}><span>${label}</span>${id === 'alerts' && ui.openCrit ? h`<span class="count">${ui.openCrit}</span>` : ''}</a>`);
   const options = ui.companies.map((c) => h`<option value="${c.id}" ${String(c.id) === ui.company ? new Raw('selected') : ''}>${c.code} — ${c.name}</option>`);
@@ -351,6 +357,22 @@ const views = {
     ${form}`;
   },
 
+  async audit() {
+    // ui.auditPages: "daha eski" ile yüklenen sayfaların başlangıç kimlikleri (boşsa en yeni sayfa).
+    const before = ui.auditPages[ui.auditPages.length - 1];
+    const params = {}; if (ui.auditArea) params.area = ui.auditArea; if (ui.auditQuery) params.q = ui.auditQuery; if (before) params.before = before;
+    const d = await api(scoped('/api/audit', params));
+    const rows = d.entries.map((e) => { const a = AUDIT[e.action] || [e.action, 'info']; return h`<tr><td class="small muted" style="white-space:nowrap">${fmtTime(e.ts)}</td>
+      <td><b>${e.username}</b>${e.role ? h`<div class="small muted">${ROLE[e.role] || e.role}</div>` : ''}</td><td>${badge(a[1], a[0])}</td>
+      <td style="overflow-wrap:anywhere">${e.target}${e.detail ? h`<div class="small muted">${e.detail}</div>` : ''}</td><td>${e.company_code || h`<span class="muted">—</span>`}</td><td class="mono muted">${e.ip || '—'}</td></tr>`; });
+    const last = d.entries[d.entries.length - 1];
+    return h`<header class="head"><div><h1>İşlem Günlüğü</h1><p>Panelde yapılan her işlem: kim, ne zaman, hangi adresten. Kayıtlar değiştirilemez ve silinemez; bir yıl saklanır.</p></div></header>
+    <section class="card"><div class="wrap between"><label class="field" style="max-width:320px"><span class="sr">Günlükte ara</span><input type="search" id="audit-search" placeholder="Kullanıcı, hedef veya IP ara" value="${ui.auditQuery}"></label>
+      <div class="wrap" role="group" aria-label="İşlem alanı">${[['', 'Tümü'], ['auth', 'Oturum'], ['alert', 'Uyarı'], ['device', 'Cihaz'], ['check', 'Servis'], ['user', 'Kullanıcı'], ['company', 'Şirket'], ['settings', 'Ayar']].map(([v, l]) => pill('audit-area', v, ui.auditArea, l))}</div></div>
+      ${rows.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:860px"><thead><tr><th>Zaman</th><th>Kullanıcı</th><th>İşlem</th><th>Hedef ve ayrıntı</th><th>Şirket</th><th>IP</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty('Eşleşen kayıt yok.')}
+      <div class="wrap" style="margin-top:16px">${ui.auditPages.length ? h`<button type="button" class="btn" data-act="audit-newest">En yeniye dön</button>` : ''}${d.more ? h`<button type="button" class="btn" data-act="audit-older" data-value="${last.id}">Daha eski kayıtlar</button>` : ''}</div></section>`;
+  },
+
   async users() {
     const [u, c] = await Promise.all([api('/api/users'), api('/api/companies')]);
     const roleOptions = (current) => Object.keys(ROLE).map((r) => h`<option value="${r}" ${r === current ? new Raw('selected') : ''}>${ROLE[r]}</option>`);
@@ -384,7 +406,7 @@ const views = {
       <div><button class="btn primary">Parolayı değiştir</button></div></form>`;
   },
 };
-const ADMIN_VIEWS = ['settings', 'users'], STATIC_VIEWS = ['settings', 'users', 'account'];
+const ADMIN_VIEWS = ['settings', 'users', 'audit'], STATIC_VIEWS = ['settings', 'users', 'account', 'audit'];
 
 // ---------------------------------------------------------------- yönlendirme ve olaylar
 function route() { const [, name = '', arg] = location.hash.split('/'); return { name: views[name] && (!ADMIN_VIEWS.includes(name) || isAdmin()) ? name : '', arg }; }
@@ -424,6 +446,9 @@ const actions = {
     if (!confirm(`${el.dataset.code} için yeni anahtar üretilsin mi? Eski anahtarı kullanan ajanlar rapor gönderemez.`)) return;
     ui.newToken = { code: el.dataset.code, token: (await api(`/api/companies/${v}/token`, {})).token };
   },
+  'audit-area': (v) => { ui.auditArea = v; ui.auditPages = []; },
+  'audit-older': (v) => { ui.auditPages.push(v); },
+  'audit-newest': () => { ui.auditPages = []; },
   'check-toggle': async (v, el) => { await api(`/api/checks/${v}`, { enabled: el.dataset.on === '1' }); },
   'check-delete': async (v, el) => { if (!confirm(`"${el.dataset.name}" kontrolü silinsin mi?`)) return false; await api(`/api/checks/${v}/delete`, {}); },
   'user-delete': async (v, el) => { if (!confirm(`${el.dataset.name} kullanıcısı silinsin mi?`)) return false; await api(`/api/users/${v}/delete`, {}); },
@@ -458,10 +483,11 @@ document.addEventListener('submit', async (ev) => {
 });
 document.addEventListener('change', (ev) => { if (ev.target.id === 'company') { actions.company(ev.target.value); render(); } });
 document.addEventListener('input', (ev) => {
-  if (ev.target.id !== 'dev-search') return;
-  ui.devQuery = ev.target.value;
+  const id = ev.target.id;
+  if (id !== 'dev-search' && id !== 'audit-search') return;
+  if (id === 'dev-search') ui.devQuery = ev.target.value; else { ui.auditQuery = ev.target.value; ui.auditPages = []; }
   clearTimeout(ui.searchTimer);
-  ui.searchTimer = setTimeout(async () => { await render(); const box = document.getElementById('dev-search'); if (box) { box.focus(); box.setSelectionRange(box.value.length, box.value.length); } }, 250);
+  ui.searchTimer = setTimeout(async () => { await render(); const box = document.getElementById(id); if (box) { box.focus(); box.setSelectionRange(box.value.length, box.value.length); } }, 250);
 });
 window.addEventListener('hashchange', () => render());
 render();

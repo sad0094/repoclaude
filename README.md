@@ -100,6 +100,18 @@ bağlantıları görür. Oturum açma denemeleri (RDP ve ağ; olay 4625/4624) he
 Kurmadan denemek için: `.\nobet-agent.ps1 -Manager https://... -Token nbt_... -Print`.
 Kaldırmak için: `.\uninstall.ps1`.
 
+## İşlem günlüğü
+
+**İşlem Günlüğü** sayfası (yalnızca yönetici) panelde yapılan her işlemi gösterir: kim, ne zaman, hangi IP'den,
+hangi şirkette ne yaptı. Kaydedilenler: giriş/çıkış ve başarısız girişler, parola değişiklikleri, uyarı onayları,
+cihaz izleme/adlandırma, servis kontrolü ekleme/değiştirme/silme, kullanıcı ve şirket işlemleri, ajan anahtarı
+yenileme, ayar değişiklikleri (eski → yeni değer) ve test bildirimleri.
+
+- Kayıtlar panelden değiştirilemez ve silinemez; bir yıl saklanır.
+- Parolalar, ajan anahtarları, Telegram bot anahtarı ve webhook adresi günlüğe yazılmaz (yalnızca "değiştirildi").
+- Manager ters vekil arkasındaysa gerçek istemci adresinin kaydedilmesi için `--trust-proxy` ile çalıştırın;
+  vekil yoksa bu seçeneği **kullanmayın** (başlık sahte olabilir).
+
 ## Servis sağlık kontrolleri
 
 **Servisler** sayfasından (yönetici ve operatör) kontrol eklenir: ad, tür (HTTP/HTTPS adresi veya TCP portu),
@@ -148,6 +160,8 @@ python3 tools/demo.py http://127.0.0.1:8080 nbt_ANAHTAR
 - Bağlantı yakalama TCP içindir ve root gerektirir. Root yoksa ajan yalnızca kabul edilen
   bağlantıları görür; panel bunu sunucu sayfasında belirtir. UDP izlenmez.
 - Ağ keşfi ajanın bulunduğu alt ağla sınırlıdır (en fazla /22); yönlendirici arkasındaki ağlar görülmez.
-- Kullanıcılar için iki adımlı doğrulama ve işlem (denetim) günlüğü yok; yalnızca uyarıyı kimin onayladığı tutulur.
+- Kullanıcılar için iki adımlı doğrulama yok.
+- İşlem günlüğü panel işlemlerini kapsar; veritabanı dosyasına doğrudan erişen biri kayıtları değiştirebilir
+  (dış bir günlük sunucusuna aktarım yok).
 - Systemd servis dosyaları ve `install.sh` gerçek bir sunucuda henüz denenmedi.
 - Veriler SQLite'ta tutulur: ölçümler 7 gün, bağlantı kayıtları ve çözülen uyarılar 30 gün saklanır.

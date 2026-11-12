@@ -8,6 +8,7 @@ SEV_LABEL = {"crit": "KRİTİK", "warn": "UYARI", "info": "BİLGİ"}
 SEV_ICON = {"crit": "\U0001F534", "warn": "\U0001F7E0", "info": "\U0001F535"}
 METRIC_RETENTION = 7 * 86400
 EVENT_RETENTION = 30 * 86400
+AUDIT_RETENTION = 365 * 86400
 MAX_CONNECTIONS = 5000
 MAX_DEVICES = 2048
 
@@ -356,3 +357,4 @@ class Engine:
             c.execute("DELETE FROM conn_events WHERE ts < ?", (now - EVENT_RETENTION,))
             c.execute("DELETE FROM alerts WHERE resolved_at IS NOT NULL AND resolved_at < ?", (now - EVENT_RETENTION,))
             c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            c.execute("DELETE FROM audit_log WHERE ts < ?", (now - AUDIT_RETENTION,))

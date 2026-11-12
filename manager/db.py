@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS checks(
 );
 CREATE TABLE IF NOT EXISTS check_results(check_id INTEGER NOT NULL, ts REAL NOT NULL, ok INTEGER NOT NULL, latency_ms REAL);
 CREATE INDEX IF NOT EXISTS check_results_idx ON check_results(check_id, ts);
+CREATE TABLE IF NOT EXISTS audit_log(
+  id INTEGER PRIMARY KEY,
+  ts REAL NOT NULL,
+  user_id INTEGER, username TEXT NOT NULL, role TEXT,   -- kullanıcı silinse de kayıt okunabilsin diye ad saklanır
+  company_id INTEGER,
+  action TEXT NOT NULL,        -- alan.eylem, ör. alert.ack
+  target TEXT DEFAULT '', detail TEXT DEFAULT '', ip TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS audit_ts ON audit_log(ts);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY,
