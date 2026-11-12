@@ -458,6 +458,13 @@ const views = {
     ${twoFactorCard()}`;
   },
 };
+function qrSvg(rows) {
+  // Kameranın okuyabilmesi için tema ne olursa olsun beyaz zemin, siyah modül ve 4 modüllük boş kenar.
+  const n = rows.length, quiet = 4;
+  let d = '';
+  rows.forEach((row, y) => { for (let x = 0; x < n; x++) if (row[x] === '1') d += `M${x + quiet} ${y + quiet}h1v1h-1z`; });
+  return h`<svg viewBox="0 0 ${n + quiet * 2} ${n + quiet * 2}" width="232" height="232" shape-rendering="crispEdges" role="img" aria-label="Kimlik doğrulama uygulamasıyla taranacak QR kod" style="display:block;border-radius:8px"><rect width="100%" height="100%" fill="#fff"/><path d="${d}" fill="#000"/></svg>`;
+}
 function twoFactorCard() {
   const me = ui.me, open = 'class="card" style="display:flex;flex-direction:column;gap:16px;max-width:520px"';
   if (ui.recovery) {
@@ -475,8 +482,9 @@ function twoFactorCard() {
     const grouped = ui.totpSetup.secret.replace(/(.{4})/g, '$1 ').trim();
     return h`<form ${new Raw(open)} data-form="totp-enable"><h2>İki adımlı doğrulama · kurulum</h2>
       <ol class="muted" style="margin:0;padding-left:20px"><li>Telefonunuzda bir kimlik doğrulama uygulaması açın (Google Authenticator, Microsoft Authenticator, Authy).</li>
-        <li>"Kurulum anahtarı gir" seçeneğiyle aşağıdaki anahtarı ekleyin (tür: zaman tabanlı).</li><li>Uygulamanın gösterdiği 6 haneli kodu yazın.</li></ol>
-      <div class="notice"><div class="small muted">Hesap: Nobet:${me.username}</div><code style="font-size:16px">${grouped}</code>
+        <li>Uygulamada "QR kod tara" seçeneğiyle aşağıdaki kodu okutun. Okutamazsanız "Kurulum anahtarı gir" ile anahtarı elle ekleyin (tür: zaman tabanlı).</li><li>Uygulamanın gösterdiği 6 haneli kodu yazın.</li></ol>
+      ${ui.totpSetup.qr && ui.totpSetup.qr.length ? qrSvg(ui.totpSetup.qr) : ''}
+      <div class="notice"><div class="small muted">Elle girmek için · Hesap: Nobet:${me.username}</div><code style="font-size:16px">${grouped}</code>
         <div class="small" style="margin-top:8px"><a href="${ui.totpSetup.uri}">Bu cihazdaki uygulamada aç</a></div></div>
       <label class="field"><span>6 haneli kod</span><input type="text" name="code" inputmode="numeric" required autocomplete="one-time-code" maxlength="7"></label>
       <div class="wrap"><button class="btn primary">Etkinleştir</button><button type="button" class="btn" data-act="totp-cancel">Vazgeç</button></div></form>`;

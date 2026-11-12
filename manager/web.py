@@ -10,7 +10,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import totp
+from . import qr, totp
 from .db import DEFAULTS, NUMERIC, check_password, hash_password, sha256
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -115,7 +115,12 @@ class App:
             raise HttpError(400, "İki adımlı doğrulama zaten etkin.")
         secret = totp.new_secret()
         self.db.write("UPDATE users SET totp_secret=?, totp_last_step=0 WHERE id=?", (secret, user["id"]))
-        return {"secret": secret, "uri": totp.provisioning_uri(secret, user["username"])}
+        uri = totp.provisioning_uri(secret, user["username"])
+        try:
+            matrix = ["".join(map(str, row)) for row in qr.encode(uri)]
+        except ValueError:      # adres QR sınırını aşarsa anahtar yine elle girilebilir
+            matrix = []
+        return {"secret": secret, "uri": uri, "qr": matrix}
 
     def totp_enable(self, user, body, keep_token):
         row = self.db.one("SELECT totp_secret, totp_enabled FROM users WHERE id=?", (user["id"],))

@@ -103,8 +103,8 @@ Kaldırmak için: `.\uninstall.ps1`.
 
 ## İki adımlı doğrulama
 
-Her kullanıcı **Hesabım** sayfasından iki adımlı doğrulamayı açabilir: telefondaki bir kimlik doğrulama
-uygulamasına (Google Authenticator, Microsoft Authenticator, Authy) kurulum anahtarı eklenir, sonraki girişlerde
+Her kullanıcı **Hesabım** sayfasından iki adımlı doğrulamayı açabilir: ekrandaki QR kod telefondaki bir kimlik
+doğrulama uygulamasıyla (Google Authenticator, Microsoft Authenticator, Authy) okutulur, sonraki girişlerde
 paroladan sonra uygulamanın gösterdiği 6 haneli kod istenir.
 
 - Kurulum sonunda 8 **kurtarma kodu** bir kez gösterilir; telefon yokken her biri bir kez kullanılabilir.
@@ -113,8 +113,8 @@ paroladan sonra uygulamanın gösterdiği 6 haneli kod istenir.
 - Telefonunu kaybeden kullanıcı için yönetici **Kullanıcılar** sayfasından "İki adımı sıfırla" der. Tek yönetici
   kilitlenirse sunucudan: `python3 -m manager --db data/nobet.db --reset-2fa --user admin`
 - Hatalı kod denemeleri hesap ve IP başına dakikada 5 ile sınırlıdır; kullanılan kod tekrar kullanılamaz.
-- Kurulum anahtarı elle girilir; QR kod gösterilmez. Telefonda açılan panelde "Bu cihazdaki uygulamada aç"
-  bağlantısı anahtarı doğrudan uygulamaya aktarır.
+- QR kod okutulamazsa aynı ekrandaki kurulum anahtarı elle girilebilir; paneli telefonda açan kullanıcı
+  "Bu cihazdaki uygulamada aç" bağlantısını kullanabilir. QR kod sunucuda üretilir, dış servise gönderilmez.
 
 ## Veri koruma (veri sızıntısı izleme)
 
@@ -205,8 +205,9 @@ python3 tools/demo.py http://127.0.0.1:8080 nbt_ANAHTAR
 - Bağlantı yakalama TCP içindir ve root gerektirir. Root yoksa ajan yalnızca kabul edilen
   bağlantıları görür; panel bunu sunucu sayfasında belirtir. UDP izlenmez.
 - Ağ keşfi ajanın bulunduğu alt ağla sınırlıdır (en fazla /22); yönlendirici arkasındaki ağlar görülmez.
-- İki adımlı doğrulamada QR kod yok (anahtar elle girilir); gizli anahtarlar veritabanında şifrelenmeden durur,
-  bu yüzden veritabanı dosyasına erişim korunmalıdır. Donanım anahtarı (WebAuthn) desteklenmez.
+- İki adımlı doğrulamada gizli anahtarlar veritabanında şifrelenmeden durur, bu yüzden veritabanı dosyasına erişim
+  korunmalıdır. Donanım anahtarı (WebAuthn) desteklenmez. QR kod üreteci testlerle doğrulandı ama gerçek bir
+  telefon kamerasıyla henüz okutulmadı.
 - İşlem günlüğü panel işlemlerini kapsar; veritabanı dosyasına doğrudan erişen biri kayıtları değiştirebilir
   (dış bir günlük sunucusuna aktarım yok).
 - Systemd servis dosyaları ve `install.sh` gerçek bir sunucuda henüz denenmedi.

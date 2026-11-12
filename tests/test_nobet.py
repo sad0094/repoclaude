@@ -20,7 +20,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "agent"))
 
 import nobet_agent as agent  # noqa: E402
-from manager import notify, totp  # noqa: E402
+from manager import notify, qr, totp  # noqa: E402
 from manager.__main__ import build  # noqa: E402
 from manager.db import hash_password  # noqa: E402
 from manager.web import make_server  # noqa: E402
@@ -313,7 +313,13 @@ class ManagerTest(unittest.TestCase):
         self.make_user("ayse", "operator", [self.xxxx])
         self.as_user("ayse")
         self.assertEqual(self.status("/api/me/totp_setup", {"password": "yanlis"}), 400)
-        secret = self.call("/api/me/totp_setup", {"password": "parola-12345"})["secret"]
+        setup = self.call("/api/me/totp_setup", {"password": "parola-12345"})
+        secret = setup["secret"]
+        # QR kod, uygulamanın okuyacağı adresi taşır.
+        decoded = qr_decode([[int(ch) for ch in row] for row in setup["qr"]])
+        self.assertEqual(decoded, setup["uri"])
+        self.assertIn(f"secret={secret}", decoded)
+        self.assertIn("Nobet%3Aayse", decoded)
         self.assertFalse(self.call("/api/me")["totp_enabled"])                # kod doğrulanmadan etkin olmaz
         self.assertEqual(self.status("/api/me/totp_enable", {"code": "000000"}), 400)
         now_step = int(time.time() // 30)
@@ -757,6 +763,140 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(self.db.num("disk_crit"), 97)
         self.assertEqual(self.status("/api/settings", {"disk_crit": "abc"}), 400)
         self.assertEqual(self.call("/api/settings/test", {})["sent"], ["telegram"])
+
+
+def qr_decode(grid):
+    """Testler için bağımsız QR çözücü: üretecin yardımcılarını kullanmadan, standarttaki kurallarla
+    matrisi okur; yapı desenlerini, biçim bilgisini ve her bloğun Reed-Solomon sendromlarını doğrular."""
+    size = len(grid)
+    version = (size - 17) // 4
+    assert size == version * 4 + 17 and all(len(row) == size for row in grid)
+    finder = ["1111111", "1000001", "1011101", "1011101", "1011101", "1000001", "1111111"]
+    for top, left in ((0, 0), (0, size - 7), (size - 7, 0)):
+        assert ["".join(map(str, grid[top + r][left:left + 7])) for r in range(7)] == finder, "bulucu desen"
+    assert all(grid[6][i] == (i + 1) % 2 and grid[i][6] == (i + 1) % 2 for i in range(8, size - 8)), "zamanlama"
+    assert grid[size - 8][8] == 1, "koyu modül"
+
+    # Biçim bilgisi: iki kopya aynı olmalı ve BCH(15,5) kodunu sağlamalı.
+    first = [grid[i][8] for i in range(6)] + [grid[7][8], grid[8][8], grid[8][7]] + [grid[8][14 - i] for i in range(9, 15)]
+    second = [grid[8][size - 1 - i] for i in range(8)] + [grid[size - 15 + i][8] for i in range(8, 15)]
+    assert first == second, "biçim kopyaları"
+    value = sum(bit << i for i, bit in enumerate(first)) ^ 0x5412
+    remainder = value
+    for bit in range(14, 9, -1):
+        if remainder >> bit & 1:
+            remainder ^= 0x537 << (bit - 10)
+    assert remainder == 0, "biçim BCH"
+    assert value >> 13 == 0, "hata düzeltme seviyesi M olmalı"
+    mask = value >> 10 & 7
+
+    # İşlev modülleri (veri taşımayan alanlar)
+    func = [[False] * size for _ in range(size)]
+    for y in range(size):
+        for x in range(size):
+            if (x <= 8 and y <= 8) or (x >= size - 8 and y <= 8) or (x <= 8 and y >= size - 8) or x == 6 or y == 6:
+                func[y][x] = True
+    centers = [] if version == 1 else [6, size - 7] if version < 7 else [6, (size - 1) // 2, size - 7]
+    for cy in centers:
+        for cx in centers:
+            if (cx == 6 and cy == 6) or (cx == 6 and cy == size - 7) or (cx == size - 7 and cy == 6):
+                continue
+            assert ["".join(map(str, grid[cy + r][cx - 2:cx + 3])) for r in range(-2, 3)] == \
+                ["11111", "10001", "10101", "10001", "11111"], "hizalama deseni"
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    func[cy + dy][cx + dx] = True
+    if version >= 7:
+        for a in range(size - 11, size - 8):
+            for b in range(6):
+                func[b][a] = func[a][b] = True
+        info = sum(grid[i // 3][size - 11 + i % 3] << i for i in range(18))
+        assert info == sum(grid[size - 11 + i % 3][i // 3] << i for i in range(18)) and info >> 12 == version, "sürüm bilgisi"
+
+    conditions = [lambda i, j: (i + j) % 2 == 0, lambda i, j: i % 2 == 0, lambda i, j: j % 3 == 0,
+                  lambda i, j: (i + j) % 3 == 0, lambda i, j: (i // 2 + j // 3) % 2 == 0,
+                  lambda i, j: i * j % 2 + i * j % 3 == 0, lambda i, j: (i * j % 2 + i * j % 3) % 2 == 0,
+                  lambda i, j: ((i + j) % 2 + i * j % 3) % 2 == 0]   # i = satır, j = sütun
+    bits, col, upward = [], size - 1, True
+    while col > 0:
+        if col == 6:
+            col -= 1
+        for row in (range(size - 1, -1, -1) if upward else range(size)):
+            for c in (col, col - 1):
+                if not func[row][c]:
+                    bits.append(grid[row][c] ^ (1 if conditions[mask](row, c) else 0))
+        col -= 2
+        upward = not upward
+    table = {1: (26, 10, [16]), 2: (44, 16, [28]), 3: (70, 26, [44]), 4: (100, 18, [32] * 2), 5: (134, 24, [43] * 2),
+             6: (172, 16, [27] * 4), 7: (196, 18, [31] * 4), 8: (242, 22, [38, 38, 39, 39]),
+             9: (292, 22, [36, 36, 36, 37, 37]), 10: (346, 26, [43, 43, 43, 43, 44])}
+    total, ec_len, sizes = table[version]
+    assert len(bits) // 8 == total, "veri modülü sayısı"
+    codewords = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, total * 8, 8)]
+    blocks, position = [[] for _ in sizes], 0
+    for i in range(max(sizes)):
+        for b, block_size in enumerate(sizes):
+            if i < block_size:
+                blocks[b].append(codewords[position])
+                position += 1
+    ec = [[] for _ in sizes]
+    for i in range(ec_len):
+        for b in range(len(sizes)):
+            ec[b].append(codewords[position])
+            position += 1
+    exp, value = [], 1
+    for _ in range(255):
+        exp.append(value)
+        value = (value << 1) ^ (0x11D if value & 0x80 else 0)
+    log = {v: i for i, v in enumerate(exp)}
+    for block, extra in zip(blocks, ec):
+        for power in range(ec_len):                      # geçerli kod sözcüğü her α^k için sıfır vermeli
+            acc = 0
+            for byte in block + extra:
+                acc = (exp[(log[acc] + power) % 255] if acc else 0) ^ byte
+            assert acc == 0, "Reed-Solomon sendromu"
+    stream = "".join(format(byte, "08b") for block in blocks for byte in block)
+    assert stream[:4] == "0100", "bayt kipi"
+    length_bits = 8 if version <= 9 else 16
+    length = int(stream[4:4 + length_bits], 2)
+    start = 4 + length_bits
+    return bytes(int(stream[start + 8 * i:start + 8 * i + 8], 2) for i in range(length)).decode("utf-8")
+
+
+class QrTest(unittest.TestCase):
+    def test_known_answers(self):
+        # Yaygın eğitim örneği ("HELLO WORLD", 1-M) ve standarttaki biçim/sürüm bilgisi tabloları
+        self.assertEqual(qr.rs_remainder([32, 91, 11, 120, 209, 114, 220, 77, 67, 64, 236, 17, 236, 17, 236, 17], 10),
+                         [196, 35, 39, 119, 235, 215, 231, 226, 93, 23])
+        self.assertEqual([format(qr._bch(m, 0x537, 10) ^ 0x5412, "015b") for m in range(8)],
+                         ["101010000010010", "101000100100101", "101111001111100", "101101101001011",
+                          "100010111111001", "100000011001110", "100111110010111", "100101010100000"])
+        self.assertEqual([format(qr._bch(v, 0x1F25, 12), "018b") for v in (7, 8, 9, 10)],
+                         ["000111110010010100", "001000010110111100", "001001101010011001", "001010010011010011"])
+        self.assertEqual([qr.capacity(v) for v in range(1, 11)], [14, 26, 42, 62, 84, 106, 122, 152, 180, 213])
+
+    def test_round_trip_all_versions_and_masks(self):
+        import random
+        random.seed(11)
+        texts = ["A", "x" * 14, "x" * 15, "y" * 42, "z" * 62, "w" * 84, "v" * 106, "u" * 122, "t" * 123,
+                 "s" * 152, "r" * 180, "q" * 181, "p" * 213, "Türkçe: ğüşiöç İĞÜŞÖÇ"]
+        texts += ["".join(chr(random.randint(32, 126)) for _ in range(random.randint(1, 213))) for _ in range(25)]
+        sizes = set()
+        for text in texts:
+            for mask in range(8):
+                grid = qr.encode(text, mask=mask)
+                self.assertEqual(qr_decode(grid), text)
+                sizes.add(len(grid))
+            self.assertEqual(qr_decode(qr.encode(text)), text)          # otomatik maske seçimi
+        self.assertEqual(sizes, {v * 4 + 17 for v in range(1, 11)})     # 1-10 arası tüm sürümler denendi
+        with self.assertRaises(ValueError):
+            qr.encode("x" * 214)
+
+    def test_decoder_rejects_corruption(self):
+        grid = qr.encode("otpauth://totp/Nobet%3Aadmin?secret=JBSWY3DPEHPK3PXP")
+        grid[len(grid) - 3][len(grid) - 3] ^= 1                         # tek veri modülü bozuldu
+        with self.assertRaises(AssertionError):
+            qr_decode(grid)
 
 
 def syn_frame(src, dst, dport, flags=0x02, vlan=False):

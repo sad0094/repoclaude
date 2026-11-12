@@ -24,6 +24,7 @@ Kritik uyarılar Telegram botuna/webhook'a gider ve onaylanana kadar tekrarlanı
 | `manager/core.py` | `Engine`: rapor işleme (`ingest`), uyarı kuralları, servis kontrol sonuçları, periyodik `tick` (çevrimdışı, tekrar bildirimi, temizlik) |
 | `manager/notify.py` | Telegram + webhook gönderimi (arka plan kuyruğu) |
 | `manager/totp.py` | İki adımlı doğrulama: TOTP üretme/doğrulama, kurtarma kodları |
+| `manager/qr.py` | QR kod üreteci (bayt kipi, seviye M, sürüm 1-10); kurulum adresini panelde göstermek için |
 | `manager/web.py` | HTTP sunucusu, oturum, kullanıcı/rol yetkilendirmesi, panel API'si, statik dosyalar |
 | `manager/static/` | Tek sayfalık panel (bağımlılıksız JS; `h\`\`` şablonu her değeri kaçışlar) |
 | `agent/nobet_agent.py` | Linux ajanı (tek dosya): /proc ölçümleri, ARP keşfi, AF_PACKET ile SYN yakalama, auth.log/journald, servis kontrolleri, USB (sysfs) ve klasör izleme (inotify) |
@@ -53,17 +54,19 @@ Tasarım kaynağı (koyu tema, renkler, yerleşim): https://claude.ai/artifact/D
 - İşlem günlüğü: paneldeki durum değiştiren her uç nokta `log(...)` (içeride `App.audit`) çağırmalı; yeni bir eylem eklenince `app.js` içindeki `AUDIT` etiket tablosuna da eklenir. Parola, anahtar, bot token'ı, webhook adresi gibi gizli değerler asla `detail` alanına yazılmaz (`App.SECRET_SETTINGS`). Günlüğü silen/değiştiren uç nokta eklenmez.
 - Veri koruma: izlenen klasörler `watch_paths` tablosunda, tanımlar rapor yanıtında (`watch_paths`) ajana gider, olaylar raporun `dlp` alanında (`usb`, `files`, `watch_status`) gelir ve `dlp_events` tablosuna yazılır. `Engine._ingest_dlp` yalnızca o sunucuya atanmış izlemenin **altındaki** yolları kabul eder (`_under`). Sayfa ve API izleyici rolüne kapalıdır (çalışan etkinliği). Dosya içeriği hiçbir zaman okunmaz/gönderilmez; yalnızca ad ve işlem türü. Kayıtlar `dlp_retention_days` sonra silinir. Kullanıcı tam içerik denetimli DLP'yi kapsam dışı bıraktı; bu modül yalnızca izleme yapar, engelleme eklenmez.
 - İki adımlı doğrulama: `manager/totp.py` (RFC 6238; test vektörleri testte). Giriş akışı `App.login(username, password, code, client)`: parola doğru ama kod yoksa `401 + totp_required` döner (hata sayılmaz). `require_2fa` ayarı açıkken kurulumu olmayan kullanıcı yalnızca `/api/me*` uç noktalarına erişir (`403 + setup_2fa`). Kurtarma kodları yalnızca SHA-256 özetiyle saklanır; TOTP gizli anahtarı hiçbir API yanıtında (kurulum anı dışında) veya günlükte yer almaz. Yeni bir kimlik doğrulama yolu eklenirse deneme sınırı (`_fails`, IP + hesap) ve işlem günlüğü kaydı da eklenmeli.
+- QR kod: `manager/qr.py` standart kitaplıkla yazıldı (dış kitaplık eklenmez). `tests/test_nobet.py` içindeki `qr_decode` üretecin yardımcılarını kullanmayan bağımsız bir çözücüdür; üreteçte değişiklik yapılırsa `QrTest` geçmeli. En fazla 213 bayt taşır; adres uzarsa `totp_setup` boş `qr` döndürür ve anahtar elle girilir. QR, gizli anahtarı içerdiği için yalnızca kurulum yanıtında bulunur; hiçbir yere kaydedilmez veya günlüğe yazılmaz.
 - Zaman damgası rapor Manager'a ulaştığında verilir; ajan saatine güvenilmez.
 - Commit iletilerine ve depoya model adı yazma. Kullanıcı açıkça istemedikçe PR açma.
 
 ## Güncel durum (son güncelleme: 12.11.2026)
 
 Çalışan ve doğrulanan:
-- Manager + Linux ajanı uçtan uca çalıştı; 40 test geçiyor; panel başsız tarayıcıda tüm sayfalarıyla denendi.
+- Manager + Linux ajanı uçtan uca çalıştı; 43 test geçiyor; panel başsız tarayıcıda tüm sayfalarıyla denendi.
 - Linux'ta SYN yakalama, loopback'e enjekte edilen çerçevelerle doğrulandı (port taraması uyarısı üretti).
 - Şirket bazlı kullanıcı/rol sistemi, servis sağlık kontrolleri, işlem günlüğü: test + tarayıcı.
 - Veri koruma: Linux klasör izleme gerçek ajanla uçtan uca; USB algılama sahte sysfs ağacıyla.
 - İki adımlı doğrulama: RFC 6238 test vektörleri, kurulum, kodla ve kurtarma koduyla giriş, tekrar kullanım engeli, deneme sınırı, zorunlu kurulum ve yönetici sıfırlaması testle; tüm akış tarayıcıda (kodlar Node ile üretilerek) doğrulandı. Gerçek bir telefon uygulamasıyla denenmedi.
+- QR kod üreteci: Reed-Solomon, biçim ve sürüm bilgisi bilinen değerlerle; tüm sürüm (1-10) ve maskelerde bağımsız çözücüyle gidiş-dönüş; panelde görüntü olarak kontrol edildi. **Gerçek telefon kamerasıyla okutulmadı** (ortamda QR okuyucu yoktu, referans kitaplığı çalıştırma izni reddedildi).
 
 Yazıldı ama doğrulanmadı:
 - **Windows ajanı ve `install.ps1`/`uninstall.ps1` hiç çalıştırılmadı** (ortamda PowerShell yoktu; indirme izni reddedildi). Servis kontrolleri ve veri koruma (`Update-UsbDevices`, `Set-WatchedFolders`, `Read-FileAuditEvents`) dahil. Yalnızca gözle inceleme, ASCII ve ayraç dengesi kontrolü yapıldı. Belirsiz noktalar: 5156/5157/5152 olaylarında kaynak/hedef yönü, XPath filtresinin performansı, `ConvertTo-Json` dizi biçimi, `HttpWebRequest` hata sarmalama, `Add-Type` sertifika geri çağrısı, `Get-Acl -Audit`/`Set-Acl` ile SACL ekleme yetkisi, 4663 olay hacmi ve klasör listelemenin "okuma" sayılması.
@@ -73,6 +76,6 @@ Yazıldı ama doğrulanmadı:
 Bilinen eksikler / sıradaki adaylar:
 1. Windows ajanını gerçek bir Windows Server'da `-Print` ile çalıştırıp hataları düzeltmek (en öncelikli; doğrulanmamış kod birikti).
 2. Veri koruma devamı: Linux'ta kullanıcı kimliği (auditd), olağandışı büyük dışa veri aktarımı uyarısı, çalışan bilgisayarları için hafif ajan.
-3. İki adımlı doğrulamada QR kod; bildirimlerin kullanıcı bazlı yönlendirilmesi; işlem günlüğünün dış sunucuya (syslog) aktarımı.
+3. Bildirimlerin kullanıcı bazlı yönlendirilmesi; işlem günlüğünün dış sunucuya (syslog) aktarımı.
 4. Servis kontrollerinde ek türler (ping, DNS, içerik eşleştirme), düzenleme formu, yanıt süresi grafiği.
 5. UDP izleme, yönlendirici arkasındaki alt ağların keşfi (SNMP), MAC üretici adı; şirket silme, dışa aktarma, raporlar.
