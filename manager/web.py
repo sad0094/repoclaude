@@ -17,6 +17,9 @@ SESSION_TTL = 7 * 86400
 MAX_BODY = 4 * 1024 * 1024
 COOKIE = "nobet_session"
 CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{1,23}$")
+UNIX_PATH_RE = re.compile(r"^(/[^/\x00]+)+/?$")
+WIN_PATH_RE = re.compile(r'^[A-Za-z]:\\[^<>:"|?*\x00]+$')
+SYSTEM_PATHS = ("/proc", "/sys", "/dev", "/run", "/etc", "/bin", "/sbin", "/usr", "/lib", "/boot", "/var/log")
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
 ROLES = ("admin", "operator", "viewer")   # yönetici, operatör, izleyici
@@ -480,6 +483,69 @@ class App:
             c.execute("DELETE FROM checks WHERE id=?", (check_id,))
         return {"ok": True}
 
+    # ------------------------------------------------------------------ veri sızıntısı izleme
+    def watch_paths(self, user, query):
+        clause, args = self._scope(user, query, "w.company_id")
+        return self.db.q(
+            "SELECT w.*, h.hostname, c.code company_code, "
+            "(SELECT COALESCE(SUM(count),0) FROM dlp_events e WHERE e.watch_id=w.id AND e.ts>=?) events_24h "
+            "FROM watch_paths w JOIN hosts h ON h.id=w.host_id JOIN companies c ON c.id=w.company_id "
+            "WHERE 1=1" + clause + " ORDER BY c.code, h.hostname, w.path", [time.time() - 86400] + args)
+
+    def create_watch_path(self, body, host):
+        path = str(body.get("path", "")).strip()
+        label = str(body.get("label", "")).strip()[:80]
+        if len(path) > 260 or any(not ch.isprintable() for ch in path) or ".." in path.replace("\\", "/").split("/"):
+            raise HttpError(400, "Geçersiz klasör yolu.")
+        if WIN_PATH_RE.match(path):
+            path = path.rstrip("\\")
+            if len(path) < 4 or path.lower().startswith(("c:\\windows", "c:\\program files", "c:\\programdata")):
+                raise HttpError(400, "Sürücünün tamamı veya sistem klasörleri izlenemez; bir alt klasör seçin.")
+        elif UNIX_PATH_RE.match(path):
+            path = path.rstrip("/")
+            if path.count("/") < 2 or any(path == p or path.startswith(p + "/") for p in SYSTEM_PATHS):
+                raise HttpError(400, "Kök dizine çok yakın veya sistem klasörleri izlenemez; ör. /srv/paylasim/muhasebe.")
+        else:
+            raise HttpError(400, "Tam klasör yolu girin (ör. D:\\Paylasim\\Muhasebe veya /srv/paylasim/muhasebe).")
+        if self.db.one("SELECT 1 FROM watch_paths WHERE host_id=? AND path=?", (host["id"], path)):
+            raise HttpError(409, "Bu klasör zaten izleniyor.")
+        if self.db.one("SELECT COUNT(*) n FROM watch_paths WHERE host_id=?", (host["id"],))["n"] >= 20:
+            raise HttpError(400, "Bir sunucuda en fazla 20 klasör izlenebilir.")
+        cur = self.db.write("INSERT INTO watch_paths(company_id,host_id,path,label,created_at) VALUES(?,?,?,?,?)",
+                            (host["company_id"], host["id"], path, label, time.time()))
+        return {"id": cur.lastrowid, "path": path}
+
+    def dlp(self, user, query):
+        try:
+            hours = max(1, min(720, int(query.get("hours", "24"))))
+        except ValueError:
+            hours = 24
+        now = time.time()
+        clause, args = self._scope(user, query, "e.company_id")
+        where, args = "FROM dlp_events e WHERE e.ts>=?" + clause, [now - hours * 3600] + args
+        def total(cond):
+            return f"COALESCE(SUM(CASE WHEN {cond} THEN e.count END),0)"
+        usb_n, file_n = total("e.kind='usb' AND e.action='insert'"), total("e.kind='file'")
+        del_n, read_n = total("e.kind='file' AND e.action='delete'"), total("e.kind='file' AND e.action='read'")
+        write_n = total("e.kind='file' AND e.action IN ('write','create','move')")
+        totals = self.db.one(
+            f"SELECT {usb_n} usb, {file_n} files, {del_n} deletes, {read_n} reads, {write_n} writes {where}", args)
+        join = "JOIN hosts h ON h.id=e.host_id JOIN companies c ON c.id=e.company_id"
+        usb = self.db.q(f"SELECT e.ts, e.action, e.device, e.detail, h.hostname, c.code company_code "
+                        f"FROM dlp_events e {join} WHERE e.ts>=?{clause} AND e.kind='usb' ORDER BY e.id DESC LIMIT 50", args)
+        users = self.db.q(
+            f"SELECT e.user, SUM(e.count) total, {read_n} reads, {write_n} writes, {del_n} deletes, "
+            f"COUNT(DISTINCT e.path) paths, MAX(e.ts) last {where} AND e.kind='file' "
+            "GROUP BY e.user ORDER BY total DESC LIMIT 15", args)
+        paths = self.db.q(
+            f"SELECT e.path, SUM(e.count) total, COUNT(DISTINCT e.user) users, MAX(e.ts) last {where} AND e.kind='file' "
+            "GROUP BY e.path ORDER BY total DESC LIMIT 10", args)
+        recent = self.db.q(
+            f"SELECT e.ts, e.action, e.user, e.path, e.count, h.hostname, c.code company_code "
+            f"FROM dlp_events e {join} WHERE e.ts>=?{clause} AND e.kind='file' ORDER BY e.id DESC LIMIT 30", args)
+        return {"now": now, "hours": hours, "totals": totals, "usb": usb, "users": users, "paths": paths,
+                "recent": recent, "watch_paths": self.watch_paths(user, query)}
+
     def companies(self, user):
         rows = self.db.q(
             "SELECT c.id, c.code, c.name, c.token_hint, c.telegram_chat_id, c.created_at, "
@@ -642,7 +708,8 @@ def make_handler(app):
                     raise HttpError(401, "Geçersiz ajan anahtarı.")
                 host_id = app.engine.ingest(company, self._body())
                 return self._send(200, {"ok": True, "company": company["code"],
-                                        "checks": app.engine.agent_checks(company["id"], host_id)})
+                                        "checks": app.engine.agent_checks(company["id"], host_id),
+                                        "watch_paths": app.engine.agent_watch_paths(company["id"], host_id)})
             if (method, path) == ("POST", "/api/login"):
                 body = self._body()
                 name, ip = str(body.get("username", "")).strip().lower(), self._client_ip()
@@ -705,6 +772,11 @@ def make_handler(app):
                     return self._send(200, {"companies": app.companies(user)})
                 if resource == "checks":
                     return self._send(200, {"now": time.time(), "checks": app.checks(user, query)})
+                if resource == "dlp":
+                    # Çalışan etkinliği içerir: izleyici rolüne kapalı.
+                    if user["role"] == "viewer":
+                        raise HttpError(403, "Bu sayfa için operatör veya yönetici yetkisi gerekli.")
+                    return self._send(200, app.dlp(user, query))
                 if resource == "settings":
                     admin_only()
                     return self._send(200, app.settings_view())
@@ -746,6 +818,20 @@ def make_handler(app):
                     log("device.label", name, f"ad: {label or '(silindi)'}", device["company_id"])
                 return self._send(200, {"ok": True})
 
+            if resource == "watchpaths" and rid and action == "delete":
+                watch = owned("watch_paths", rid)
+                app.db.write("DELETE FROM watch_paths WHERE id=?", (rid,))
+                log("watch.delete", watch["path"], company_id=watch["company_id"])
+                return self._send(200, {"ok": True})
+            if resource == "watchpaths" and not rid:
+                try:
+                    host_id = int(body.get("host_id"))
+                except (TypeError, ValueError):
+                    raise HttpError(400, "Klasörün bulunduğu sunucuyu seçin.")
+                host = owned("hosts", host_id)
+                result = app.create_watch_path(body, host)
+                log("watch.create", result["path"], host["hostname"], host["company_id"])
+                return self._send(201, result)
             if resource == "checks" and rid and action == "delete":
                 check = owned("checks", rid)
                 result = app.delete_check(rid)

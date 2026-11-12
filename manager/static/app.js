@@ -11,7 +11,7 @@ function h(strings, ...vals) {
 }
 const app = document.getElementById('app');
 const ui = { me: null, company: localStorage.getItem('nobet.company') || '', companies: [], openCrit: 0,
-  auditArea: '', auditQuery: '', auditPages: [], alertSev: 'all', alertState: 'open', devStatus: 'all', devQuery: '', hostIssues: false, hours: 24, newToken: null };
+  dlpHours: 24, auditArea: '', auditQuery: '', auditPages: [], alertSev: 'all', alertState: 'open', devStatus: 'all', devQuery: '', hostIssues: false, hours: 24, newToken: null };
 let timer = null;
 
 // ---------------------------------------------------------------- yardımcılar
@@ -66,6 +66,7 @@ const AUDIT = { 'auth.login': ['Giriş', 'ok'], 'auth.login_failed': ['Başarıs
   'check.create': ['Kontrol eklendi', 'info'], 'check.update': ['Kontrol değişti', 'info'], 'check.delete': ['Kontrol silindi', 'warn'],
   'user.create': ['Kullanıcı eklendi', 'warn'], 'user.update': ['Kullanıcı değişti', 'warn'], 'user.delete': ['Kullanıcı silindi', 'warn'],
   'company.create': ['Şirket eklendi', 'warn'], 'company.update': ['Şirket değişti', 'warn'], 'company.token': ['Anahtar yenilendi', 'warn'],
+  'watch.create': ['Klasör izlemeye alındı', 'warn'], 'watch.delete': ['Klasör izlemesi kaldırıldı', 'warn'],
   'settings.update': ['Ayar değişti', 'warn'], 'settings.test': ['Test bildirimi', 'info'] };
 const STATUS = { ok: 'Sağlıklı', warn: 'Uyarı', crit: 'Kritik', down: 'Çevrimdışı' };
 const PORTS = { 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS', 80: 'HTTP', 110: 'POP3', 135: 'RPC', 139: 'NetBIOS', 143: 'IMAP',
@@ -127,9 +128,9 @@ function barChart(buckets, parts, label) {
 }
 
 // ---------------------------------------------------------------- iskelet
-const NAV = [['', 'Genel Bakış'], ['hosts', 'Sunucular'], ['devices', 'Ağ Cihazları'], ['connections', 'Bağlantı Analizi'], ['services', 'Servisler'], ['alerts', 'Uyarılar'], ['users', 'Kullanıcılar', true], ['audit', 'İşlem Günlüğü', true], ['settings', 'Ayarlar', true], ['account', 'Hesabım']];
+const NAV = [['', 'Genel Bakış'], ['hosts', 'Sunucular'], ['devices', 'Ağ Cihazları'], ['connections', 'Bağlantı Analizi'], ['services', 'Servisler'], ['dlp', 'Veri Koruma', false, true], ['alerts', 'Uyarılar'], ['users', 'Kullanıcılar', true], ['audit', 'İşlem Günlüğü', true], ['settings', 'Ayarlar', true], ['account', 'Hesabım']];
 function shell(route, content) {
-  const links = NAV.filter(([, , adminOnly]) => !adminOnly || isAdmin()).map(([id, label]) => h`<a class="nav ${route === id ? 'on' : ''}" href="#/${id}" ${route === id ? new Raw('aria-current="page"') : ''}><span>${label}</span>${id === 'alerts' && ui.openCrit ? h`<span class="count">${ui.openCrit}</span>` : ''}</a>`);
+  const links = NAV.filter(([, , adminOnly, editorOnly]) => (!adminOnly || isAdmin()) && (!editorOnly || canEdit())).map(([id, label]) => h`<a class="nav ${route === id ? 'on' : ''}" href="#/${id}" ${route === id ? new Raw('aria-current="page"') : ''}><span>${label}</span>${id === 'alerts' && ui.openCrit ? h`<span class="count">${ui.openCrit}</span>` : ''}</a>`);
   const options = ui.companies.map((c) => h`<option value="${c.id}" ${String(c.id) === ui.company ? new Raw('selected') : ''}>${c.code} — ${c.name}</option>`);
   return h`<div class="shell"><nav class="side" aria-label="Ana menü">
     <div class="brand"><svg aria-hidden="true" width="26" height="26" viewBox="0 0 26 26" fill="none" stroke="#5AA9FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13" cy="13" r="11"/><path d="M5 13h4l2-5 4 10 2-5h4"/></svg>Nöbet</div>
@@ -322,6 +323,8 @@ const views = {
       <div class="row">${num('disk_warn', 'Disk uyarı (%)')}${num('disk_crit', 'Disk kritik (%)')}${num('cpu_warn', 'CPU uyarı (%)')}${num('mem_warn', 'Bellek uyarı (%)')}</div>
       <div class="row">${num('offline_seconds', 'Sunucu çevrimdışı sayılma süresi (sn)')}${num('device_offline_seconds', 'İzlenen cihaz çevrimdışı süresi (sn)')}${num('scan_ports', 'Port taraması eşiği (10 dk içinde port)')}${num('brute_fails', 'Parola saldırısı eşiği (10 dk içinde hata)')}</div>
       <div class="row">${num('check_fail_count', 'Servis uyarısı için art arda başarısız kontrol')}${num('cert_warn_days', 'Sertifika uyarısı (kalan gün)')}</div>
+      <h2>Veri koruma</h2>
+      <div class="row">${num('usb_alert', 'USB takılınca uyar (1 = açık, 0 = kapalı)')}${num('dlp_delete_threshold', 'Toplu silme eşiği (10 dk, 0 = kapalı)')}${num('dlp_read_threshold', 'Toplu okuma eşiği (10 dk, 0 = kapalı)')}${num('dlp_retention_days', 'Kayıt saklama süresi (gün)')}</div>
       <div class="wrap"><button class="btn primary">Ayarları kaydet</button><button type="button" class="btn" data-act="test-notify">Test bildirimi gönder</button></div></form>`;
   },
 
@@ -373,6 +376,43 @@ const views = {
       <div class="wrap" style="margin-top:16px">${ui.auditPages.length ? h`<button type="button" class="btn" data-act="audit-newest">En yeniye dön</button>` : ''}${d.more ? h`<button type="button" class="btn" data-act="audit-older" data-value="${last.id}">Daha eski kayıtlar</button>` : ''}</div></section>`;
   },
 
+  async dlp() {
+    const [d, hd] = await Promise.all([api(scoped('/api/dlp', { hours: ui.dlpHours })), api(scoped('/api/hosts'))]);
+    const t = d.totals;
+    const ACT = { read: ['info', 'Okuma'], write: ['warn', 'Yazma'], create: ['info', 'Oluşturma'], delete: ['down', 'Silme'], move: ['warn', 'Taşıma'] };
+    const who = (u) => (u ? h`<b>${u}</b>` : h`<span class="muted">Bilinmiyor</span>`);
+    const usb = d.usb.map((e) => h`<tr><td class="small muted" style="white-space:nowrap">${fmtTime(e.ts)}</td><td>${e.action === 'insert' ? badge('warn', 'Takıldı') : badge('info', 'Çıkarıldı')}</td>
+      <td><b>${e.device}</b>${e.detail ? h`<div class="small muted">${e.detail}</div>` : ''}</td><td>${e.hostname}<span class="muted small"> · ${e.company_code}</span></td></tr>`);
+    const users = d.users.map((u) => h`<tr><td>${who(u.user)}</td><td class="num">${nf.format(u.reads)}</td><td class="num">${nf.format(u.writes)}</td>
+      <td class="num ${u.deletes ? 't-crit' : ''}">${nf.format(u.deletes)}</td><td class="num">${u.paths}</td><td class="small muted">${ago(d.now, u.last)}</td></tr>`);
+    const paths = d.paths.map((x) => h`<tr><td class="mono" style="overflow-wrap:anywhere">${x.path}</td><td class="num">${nf.format(x.total)}</td><td class="num">${x.users}</td></tr>`);
+    const recent = d.recent.map((e) => h`<tr><td class="small muted" style="white-space:nowrap">${fmtTime(e.ts)}</td><td>${badge(ACT[e.action][0], ACT[e.action][1])}</td><td>${who(e.user)}</td>
+      <td class="mono" style="overflow-wrap:anywhere">${e.path}</td><td>${e.hostname}<span class="muted small"> · ${e.company_code}</span></td><td class="num">${nf.format(e.count)}</td></tr>`);
+    const watches = d.watch_paths.map((w) => h`<tr><td><span class="mono" style="overflow-wrap:anywhere">${w.path}</span>${w.label ? h`<div class="small muted">${w.label}</div>` : ''}</td>
+      <td>${w.status === 'ok' ? badge('ok', 'İzleniyor') : w.status === 'error' ? badge('down', 'Sorun var') : badge('off', 'Ajan bekleniyor')}${w.detail ? h`<div class="small muted">${w.detail}</div>` : ''}</td>
+      <td>${w.hostname}<span class="muted small"> · ${w.company_code}</span></td><td class="num">${nf.format(w.events_24h)}</td>
+      <td><button type="button" class="btn" data-act="watch-delete" data-value="${w.id}" data-name="${w.path}">Kaldır</button></td></tr>`);
+    return h`<header class="head"><div><h1>Veri Koruma</h1><p>USB depolama takılması ve hassas klasörlerdeki dosya işlemleri. Yalnızca dosya adı ve işlem türü kaydedilir; dosya içeriği okunmaz.</p></div>
+      <div class="wrap" role="group" aria-label="Zaman aralığı">${pill('dlp-hours', '1', String(ui.dlpHours), '1 saat')}${pill('dlp-hours', '24', String(ui.dlpHours), '24 saat')}${pill('dlp-hours', '168', String(ui.dlpHours), '7 gün')}</div></header>
+    <div class="notice small">Bu sayfa çalışanların dosya ve cihaz kullanımına ilişkin kayıtlar içerir. İzlemeye başlamadan önce ilgili şirkette çalışanların bilgilendirilmiş olması gerekir (KVKK). Kayıtlar Ayarlar'da belirlenen süre sonunda silinir; izleyici rolü bu sayfayı göremez.</div>
+    <section class="row" aria-label="Özet">
+      <div class="card kpi"><div class="label">USB depolama takılması</div><div class="value ${t.usb ? 't-warn' : ''}">${nf.format(t.usb)}</div><div class="note">Ajan kurulu sunucularda</div></div>
+      <div class="card kpi"><div class="label">Dosya işlemi</div><div class="value">${nf.format(t.files)}</div><div class="note">${nf.format(t.reads)} okuma · ${nf.format(t.writes)} yazma</div></div>
+      <div class="card kpi"><div class="label">Silme</div><div class="value ${t.deletes ? 't-crit' : ''}">${nf.format(t.deletes)}</div><div class="note">İzlenen klasörlerde</div></div>
+      <div class="card kpi"><div class="label">İzlenen klasör</div><div class="value">${d.watch_paths.length}</div><div class="note">${d.watch_paths.filter((w) => w.status === 'error').length} tanesinde sorun var</div></div></section>
+    <section class="card"><h2>İzlenen klasörler</h2>
+      ${watches.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:780px"><thead><tr><th>Klasör</th><th>Durum</th><th>Sunucu</th><th class="num">24 sa işlem</th><th>İşlem</th></tr></thead><tbody>${watches}</tbody></table></div>` : empty('Henüz izlenen klasör yok.')}
+      ${hd.hosts.length ? h`<form data-form="watch-new" class="row" style="margin-top:16px;align-items:flex-end"><label class="field" style="flex:2 1 300px"><span>Klasörün tam yolu</span><input type="text" name="path" required maxlength="260" autocapitalize="none" placeholder="D:\\Paylasim\\Muhasebe veya /srv/paylasim/muhasebe"></label>
+        <label class="field"><span>Açıklama (isteğe bağlı)</span><input type="text" name="label" maxlength="80" placeholder="Muhasebe belgeleri"></label>
+        <label class="field"><span>Sunucu</span><select name="host_id">${hd.hosts.map((x) => h`<option value="${x.id}">${x.company_code} — ${x.hostname}</option>`)}</select></label>
+        <button class="btn primary">İzlemeye al</button></form>` : ''}</section>
+    <section class="card"><h2>USB olayları</h2>${usb.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:520px"><thead><tr><th>Zaman</th><th>Olay</th><th>Aygıt</th><th>Sunucu</th></tr></thead><tbody>${usb}</tbody></table></div>` : empty('Bu aralıkta USB olayı yok.')}</section>
+    <section class="card"><h2>En çok işlem gören dosyalar</h2>${paths.length ? h`<table style="margin-top:12px"><thead><tr><th>Dosya</th><th class="num">İşlem</th><th class="num">Kullanıcı</th></tr></thead><tbody>${paths}</tbody></table>` : empty('Kayıt yok.')}</section>
+    <section class="card"><h2>Kullanıcılara göre dosya işlemleri</h2><p class="small muted" style="margin:4px 0 0">Kullanıcı adı yalnızca Windows sunucularda bilinir; Linux'ta "Bilinmiyor" görünür.</p>
+      ${users.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:620px"><thead><tr><th>Kullanıcı</th><th class="num">Okuma</th><th class="num">Yazma</th><th class="num">Silme</th><th class="num">Dosya</th><th>Son</th></tr></thead><tbody>${users}</tbody></table></div>` : empty('Kayıt yok.')}</section>
+    <section class="card"><h2>Son dosya işlemleri</h2>${recent.length ? h`<div class="scroll" style="margin-top:12px"><table style="min-width:820px"><thead><tr><th>Zaman</th><th>İşlem</th><th>Kullanıcı</th><th>Dosya</th><th>Sunucu</th><th class="num">Adet</th></tr></thead><tbody>${recent}</tbody></table></div>` : empty('Bu aralıkta dosya işlemi yok.')}</section>`;
+  },
+
   async users() {
     const [u, c] = await Promise.all([api('/api/users'), api('/api/companies')]);
     const roleOptions = (current) => Object.keys(ROLE).map((r) => h`<option value="${r}" ${r === current ? new Raw('selected') : ''}>${ROLE[r]}</option>`);
@@ -409,7 +449,7 @@ const views = {
 const ADMIN_VIEWS = ['settings', 'users', 'audit'], STATIC_VIEWS = ['settings', 'users', 'account', 'audit'];
 
 // ---------------------------------------------------------------- yönlendirme ve olaylar
-function route() { const [, name = '', arg] = location.hash.split('/'); return { name: views[name] && (!ADMIN_VIEWS.includes(name) || isAdmin()) ? name : '', arg }; }
+function route() { const [, name = '', arg] = location.hash.split('/'); return { name: views[name] && (!ADMIN_VIEWS.includes(name) || isAdmin()) && (name !== 'dlp' || canEdit()) ? name : '', arg }; }
 async function render(auto = false) {
   clearTimeout(timer);
   if (!ui.me) { try { ui.me = await api('/api/me'); } catch (err) { return; } }
@@ -446,6 +486,8 @@ const actions = {
     if (!confirm(`${el.dataset.code} için yeni anahtar üretilsin mi? Eski anahtarı kullanan ajanlar rapor gönderemez.`)) return;
     ui.newToken = { code: el.dataset.code, token: (await api(`/api/companies/${v}/token`, {})).token };
   },
+  'dlp-hours': (v) => { ui.dlpHours = Number(v); },
+  'watch-delete': async (v, el) => { if (!confirm(`${el.dataset.name} klasörünün izlenmesi kaldırılsın mı?`)) return false; await api(`/api/watchpaths/${v}/delete`, {}); },
   'audit-area': (v) => { ui.auditArea = v; ui.auditPages = []; },
   'audit-older': (v) => { ui.auditPages.push(v); },
   'audit-newest': () => { ui.auditPages = []; },
@@ -473,6 +515,7 @@ document.addEventListener('submit', async (ev) => {
       else { body.active = form.active.checked; await api(`/api/users/${form.dataset.id}`, body); toast('Kullanıcı güncellendi.'); }
       if (form.dataset.id === String(ui.me.id)) ui.me = null;
     }
+    if (form.dataset.form === 'watch-new') { data.host_id = Number(data.host_id); await api('/api/watchpaths', data); toast('Klasör izlemeye alındı; ajan bir sonraki raporda başlar.'); }
     if (form.dataset.form === 'check-new') { data.verify = form.verify.checked; data.host_id = Number(data.host_id); await api('/api/checks', data); toast('Kontrol eklendi; ilk sonuç bir sonraki ajan raporuyla gelir.'); }
     if (form.dataset.form === 'password') { await api('/api/me/password', data); toast('Parola değiştirildi.'); }
     if (form.dataset.form === 'company-new') { ui.newToken = await api('/api/companies', data); }

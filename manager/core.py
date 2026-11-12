@@ -54,6 +54,22 @@ def _mac(value):
     return None
 
 
+def _fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _under(path, root):
+    """path, root klasörünün kendisi ya da altında mı? (Windows yolları için büyük/küçük harf duyarsız.)"""
+    windows = len(root) > 1 and root[1] == ":"
+    sep = "\\" if windows else "/"
+    a, b = (path.lower(), root.lower()) if windows else (path, root)
+    b = b.rstrip(sep)
+    return ".." not in path.split(sep) and (a == b or a.startswith(b + sep))
+
+
 def fmt_time(ts):
     return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
 
@@ -147,7 +163,8 @@ class Engine:
         disk_max = max((d["pct"] for d in disks), default=None)
         cfg = {k: self.db.num(k) for k in
                ("disk_warn", "disk_crit", "cpu_warn", "mem_warn", "scan_ports", "brute_fails",
-                "device_offline_seconds", "check_fail_count", "cert_warn_days")}
+                "device_offline_seconds", "check_fail_count", "cert_warn_days",
+                "usb_alert", "dlp_delete_threshold", "dlp_read_threshold")}
 
         with self.db.tx() as c:
             c.execute(
@@ -176,7 +193,63 @@ class Engine:
                 self._ingest_devices(c, cid, hid, payload["devices"], had_scan, cfg, now)
             if isinstance(payload.get("checks"), list):
                 self._ingest_checks(c, cid, hid, payload["checks"], cfg, now)
+            if isinstance(payload.get("dlp"), dict):
+                self._ingest_dlp(c, cid, hid, payload["dlp"], cfg, now)
         return hid
+
+    # ------------------------------------------------------------------ veri sızıntısı izleme
+    FILE_ACTIONS = ("read", "write", "create", "delete", "move")
+
+    def agent_watch_paths(self, company_id, host_id):
+        """Ajanın izleyeceği hassas klasörler (rapor yanıtında gönderilir)."""
+        return self.db.q("SELECT id, path FROM watch_paths WHERE company_id=? AND host_id=? ORDER BY id",
+                         (company_id, host_id))
+
+    def _ingest_dlp(self, c, cid, hid, dlp, cfg, now):
+        for u in (dlp.get("usb") or [])[:50]:
+            if not isinstance(u, dict) or u.get("action") not in ("insert", "remove"):
+                continue
+            name = " ".join(x for x in (_s(u.get("vendor"), 40).strip(), _s(u.get("model"), 60).strip()) if x) or "USB depolama"
+            serial, size = _s(u.get("serial"), 64).strip(), _i(u.get("size"))
+            detail = " · ".join(x for x in (f"seri {serial}" if serial else "", _fmt_size(size) if size else "") if x)
+            c.execute("INSERT INTO dlp_events(company_id,host_id,ts,kind,action,device,detail) VALUES(?,?,?,'usb',?,?,?)",
+                      (cid, hid, now, u["action"], name, detail))
+            if u["action"] == "insert" and cfg["usb_alert"] >= 1:
+                self.raise_alert(c, cid, hid, "usb:" + (serial or name), "warn", f"USB depolama takıldı: {name}",
+                                 detail, now, expire_after=3600)
+
+        # Ajan yalnızca kendi sunucusuna atanmış klasörler için, o klasörün altındaki yolları bildirebilir.
+        watches = {w["id"]: w for w in c.execute(
+            "SELECT id, path FROM watch_paths WHERE company_id=? AND host_id=?", (cid, hid)).fetchall()}
+        for st in (dlp.get("watch_status") or [])[:200]:
+            w = watches.get(_i(st.get("id"))) if isinstance(st, dict) else None
+            if w:
+                c.execute("UPDATE watch_paths SET status=?, detail=?, checked_at=? WHERE id=?",
+                          ("ok" if st.get("ok") is True else "error", _s(st.get("detail"), 160), now, w["id"]))
+        users = set()
+        for f in (dlp.get("files") or [])[:2000]:
+            w = watches.get(_i(f.get("watch_id"))) if isinstance(f, dict) else None
+            path, count = _s(f.get("path") if isinstance(f, dict) else "", 400), _i(f.get("count"), 1, 10**9) if isinstance(f, dict) else None
+            if not w or not count or f.get("action") not in self.FILE_ACTIONS:
+                continue
+            if not _under(path, w["path"]):
+                continue
+            user = _s(f.get("user"), 80)
+            c.execute("INSERT INTO dlp_events(company_id,host_id,ts,kind,action,user,path,watch_id,count) "
+                      "VALUES(?,?,?,'file',?,?,?,?,?)", (cid, hid, now, f["action"], user, path, w["id"], count))
+            users.add(user)
+        for user in users:
+            row = c.execute(
+                "SELECT COALESCE(SUM(CASE WHEN action='delete' THEN count END),0) deleted, "
+                "COALESCE(SUM(CASE WHEN action='read' THEN count END),0) reads FROM dlp_events "
+                "WHERE host_id=? AND kind='file' AND user=? AND ts>=?", (hid, user, now - 600)).fetchone()
+            who = user or "bilinmeyen kullanıcı"
+            if cfg["dlp_delete_threshold"] and row["deleted"] >= cfg["dlp_delete_threshold"]:
+                self.raise_alert(c, cid, hid, "massdel:" + user, "crit", f"Toplu dosya silme: {who}",
+                                 f"Son 10 dakikada izlenen klasörlerde {row['deleted']} silme", now, expire_after=1800)
+            if cfg["dlp_read_threshold"] and row["reads"] >= cfg["dlp_read_threshold"]:
+                self.raise_alert(c, cid, hid, "massread:" + user, "warn", f"Toplu dosya erişimi: {who}",
+                                 f"Son 10 dakikada izlenen klasörlerde {row['reads']} okuma", now, expire_after=1800)
 
     # ------------------------------------------------------------------ servis sağlık kontrolleri
     def agent_checks(self, company_id, host_id):
@@ -358,3 +431,5 @@ class Engine:
             c.execute("DELETE FROM alerts WHERE resolved_at IS NOT NULL AND resolved_at < ?", (now - EVENT_RETENTION,))
             c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
             c.execute("DELETE FROM audit_log WHERE ts < ?", (now - AUDIT_RETENTION,))
+            # Çalışan etkinliği içeren kayıtlar yalnızca ayarlanan süre kadar tutulur (veri azaltma).
+            c.execute("DELETE FROM dlp_events WHERE ts < ?", (now - max(1, self.db.num("dlp_retention_days")) * 86400,))

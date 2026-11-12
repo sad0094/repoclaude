@@ -7,12 +7,16 @@ Tek dosya, yalnızca Python 3.8+ standart kitaplığı (Linux). Topladıkları:
   * sunucuya gelen bağlantı denemeleri (TCP SYN yakalama; kapalı portlara gelenler dahil)
   * SSH giriş denemeleri (başarılı/başarısız)
   * Manager'da tanımlanan servis sağlık kontrolleri (TCP portu, HTTP/HTTPS adresi, sertifika süresi)
+  * veri sızıntısı izleme: USB depolama takılması ve Manager'da tanımlanan hassas klasörlerdeki
+    dosya işlemleri (inotify; Linux'ta işlemi yapan kullanıcı bilinmez)
 
 Kullanım:  nobet_agent.py --config /etc/nobet/agent.json
            nobet_agent.py --manager https://panel.example.com --token nbt_... [--once --print]
 """
 import argparse
 import concurrent.futures
+import ctypes
+import ctypes.util
 import http.client
 import ipaddress
 import json
@@ -21,6 +25,7 @@ import platform
 import re
 import shutil
 import socket
+import select
 import ssl
 import struct
 import subprocess
@@ -421,6 +426,212 @@ class AuthLog:
             return []
 
 
+# ----------------------------------------------------------------------------- veri sızıntısı izleme
+def scan_usb_storage(sys_block="/sys/block"):
+    """Takılı USB depolama aygıtlarını {anahtar: bilgi} olarak döndürür (sysfs üzerinden)."""
+    def read(path):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+    found = {}
+    try:
+        names = os.listdir(sys_block)
+    except OSError:
+        return found
+    for name in names:
+        device = os.path.join(sys_block, name, "device")
+        real = os.path.realpath(device)
+        if "/usb" not in real:
+            continue
+        try:
+            size = int(read(os.path.join(sys_block, name, "size")) or 0) * 512
+        except ValueError:
+            size = 0
+        info = {"vendor": read(os.path.join(device, "vendor")), "model": read(os.path.join(device, "model")),
+                "size": size, "serial": ""}
+        parent = real
+        for _ in range(8):   # seri numarası USB aygıt düğümünde, birkaç seviye yukarıda durur
+            if os.path.isfile(os.path.join(parent, "serial")):
+                info["serial"] = read(os.path.join(parent, "serial"))
+                break
+            parent = os.path.dirname(parent)
+        found[info["serial"] or name] = info
+    return found
+
+
+class UsbMonitor:
+    """USB depolama takılma/çıkarılma olaylarını yakalar. Başlangıçta takılı olanlar olay sayılmaz."""
+
+    def __init__(self, sys_block="/sys/block", interval=3):
+        self.sys_block = sys_block
+        self.known = scan_usb_storage(sys_block)
+        self.events = []
+        self.lock = threading.Lock()
+        if interval:
+            threading.Thread(target=self._loop, args=(interval,), daemon=True).start()
+
+    def _loop(self, interval):
+        while True:
+            time.sleep(interval)
+            self.poll()
+
+    def poll(self):
+        current = scan_usb_storage(self.sys_block)
+        with self.lock:
+            for key, info in current.items():
+                if key not in self.known:
+                    self.events.append(dict(info, action="insert"))
+            for key, info in self.known.items():
+                if key not in current:
+                    self.events.append(dict(info, action="remove"))
+            self.known = current
+            del self.events[:-200]
+
+    def drain(self):
+        with self.lock:
+            events, self.events = self.events, []
+        return events
+
+    def restore(self, events):
+        with self.lock:
+            self.events = events + self.events
+
+
+IN_CLOSE_WRITE, IN_CLOSE_NOWRITE, IN_MOVED_FROM, IN_MOVED_TO = 0x8, 0x10, 0x40, 0x80
+IN_CREATE, IN_DELETE, IN_Q_OVERFLOW, IN_IGNORED, IN_ISDIR = 0x100, 0x200, 0x4000, 0x8000, 0x40000000
+IN_ONLYDIR, IN_DONT_FOLLOW = 0x01000000, 0x02000000
+WATCH_MASK = IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
+FORBIDDEN_ROOTS = ("/", "/proc", "/sys", "/dev", "/run", "/etc", "/bin", "/sbin", "/usr", "/lib", "/boot")
+
+
+class FolderWatcher:
+    """Hassas klasörlerdeki dosya işlemlerini inotify ile izler (alt klasörler dahil).
+
+    Yalnızca dosya adı ve işlem türü kaydedilir; dosya içeriği okunmaz. inotify işlemi yapan
+    kullanıcıyı bildirmediği için Linux'ta kullanıcı alanı boş kalır."""
+    MAX_DIRS = 8192
+
+    def __init__(self, watches):
+        self.counts, self.lock = {}, threading.Lock()
+        self.dirs, self.status, self.total_dirs, self.overflow = {}, {}, 0, False
+        self.libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        self.closed = self.fd < 0
+        for w in watches:
+            self.status[w["id"]] = self._add_root(w["id"], str(w.get("path", "")))
+        if not self.closed:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _add_root(self, watch_id, root):
+        root = os.path.normpath(root)
+        if self.closed:
+            return {"id": watch_id, "ok": False, "detail": "inotify kullanılamıyor"}
+        if not os.path.isabs(root) or root in FORBIDDEN_ROOTS:
+            return {"id": watch_id, "ok": False, "detail": "Bu klasör izlenemez"}
+        if not os.path.isdir(root):
+            return {"id": watch_id, "ok": False, "detail": "Klasör bulunamadı"}
+        added = self._add_tree(watch_id, root)
+        if not added:
+            return {"id": watch_id, "ok": False, "detail": "Klasör izlenemedi (izin veya sınır)"}
+        full = self.total_dirs >= self.MAX_DIRS
+        return {"id": watch_id, "ok": True,
+                "detail": f"{added} klasör izleniyor" + (" (sınıra ulaşıldı, bir kısmı izlenmiyor)" if full else "")}
+
+    def _add_tree(self, watch_id, root):
+        added = 0
+        for path, subdirs, _ in os.walk(root, followlinks=False):
+            if self.total_dirs >= self.MAX_DIRS:
+                break
+            wd = self.libc.inotify_add_watch(self.fd, os.fsencode(path), WATCH_MASK | IN_ONLYDIR | IN_DONT_FOLLOW)
+            if wd < 0:
+                subdirs[:] = []
+                continue
+            if wd not in self.dirs:
+                self.total_dirs += 1
+            self.dirs[wd] = (watch_id, path)
+            added += 1
+        return added
+
+    def _run(self):
+        while not self.closed:
+            try:
+                if not select.select([self.fd], [], [], 1)[0]:
+                    continue
+                data = os.read(self.fd, 65536)
+            except (OSError, ValueError):
+                if self.closed:
+                    return
+                time.sleep(0.5)
+                continue
+            self.handle(data)
+
+    def handle(self, data):
+        offset = 0
+        while offset + 16 <= len(data):
+            wd, mask, _, length = struct.unpack_from("iIII", data, offset)
+            name = data[offset + 16:offset + 16 + length].split(b"\0", 1)[0]
+            offset += 16 + length
+            if mask & IN_Q_OVERFLOW:
+                self.overflow = True
+                continue
+            entry = self.dirs.get(wd)
+            if mask & IN_IGNORED:
+                if self.dirs.pop(wd, None):
+                    self.total_dirs -= 1
+                continue
+            if not entry or not name:
+                continue
+            watch_id, directory = entry
+            path = os.path.join(directory, os.fsdecode(name))
+            if mask & IN_ISDIR:
+                if mask & (IN_CREATE | IN_MOVED_TO):
+                    self._add_tree(watch_id, path)   # yeni alt klasör de izlenir
+                if mask & IN_CLOSE_NOWRITE:
+                    continue                         # klasör listeleme: gürültü
+            if mask & IN_CLOSE_WRITE:
+                action = "write"
+            elif mask & IN_CLOSE_NOWRITE:
+                action = "read"
+            elif mask & IN_CREATE:
+                action = "create"
+            elif mask & IN_DELETE:
+                action = "delete"
+            elif mask & (IN_MOVED_FROM | IN_MOVED_TO):
+                action = "move"
+            else:
+                continue
+            key = (watch_id, action, path)
+            with self.lock:
+                if key in self.counts or len(self.counts) < MAX_PENDING:
+                    self.counts[key] = self.counts.get(key, 0) + 1
+
+    def drain(self, limit=2000):
+        """En fazla `limit` kayıt döndürür; kalanı sonraki rapora kalır."""
+        with self.lock:
+            keys = list(self.counts)[:limit]
+            return {k: self.counts.pop(k) for k in keys}
+
+    def restore(self, counts):
+        with self.lock:
+            for key, n in counts.items():
+                self.counts[key] = self.counts.get(key, 0) + n
+
+    def statuses(self):
+        out = list(self.status.values())
+        if self.overflow:
+            out = [dict(st, detail=st["detail"] + " · olay kuyruğu taştı, bazı işlemler kaydedilmedi") for st in out]
+        return out
+
+    def close(self):
+        self.closed = True
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
 # ----------------------------------------------------------------------------- servis sağlık kontrolleri
 MAX_CHECKS = 50
 
@@ -527,6 +738,9 @@ class Agent:
         self.last_scan = 0
         self.pending_auth = {}
         self.checks = []   # Manager'ın son rapor yanıtında gönderdiği kontrol tanımları
+        self.dlp = cfg.get("dlp", True)
+        self.usb = UsbMonitor() if self.dlp else None
+        self.watch_defs, self.watcher = [], None   # Manager'ın gönderdiği hassas klasörler
         self.ssl_ctx = ssl.create_default_context(cafile=cfg.get("ca_file"))
         if cfg.get("insecure"):
             print("uyarı: TLS sertifika doğrulaması kapalı (insecure)", file=sys.stderr)
@@ -574,6 +788,14 @@ class Agent:
         }
         if self.checks and self.cfg.get("checks", True):
             report["checks"] = run_checks(self.checks)
+        pending = {"usb": self.usb.drain() if self.usb else [], "files": self.watcher.drain() if self.watcher else {}}
+        if pending["usb"] or pending["files"] or self.watcher:
+            report["dlp"] = {
+                "usb": pending["usb"],
+                "files": [{"watch_id": w, "action": a, "path": p, "user": "", "count": n}
+                          for (w, a, p), n in pending["files"].items()],
+                "watch_status": self.watcher.statuses() if self.watcher else []}
+        self._pending_dlp = pending
         if self.cfg.get("discovery", True) and time.time() - self.last_scan >= self.cfg.get("scan_interval", 300):
             report["devices"] = self.discovery.scan(self.nets)
             self.last_scan = time.time()
@@ -588,11 +810,23 @@ class Agent:
         with urllib.request.urlopen(req, timeout=20, context=self.ssl_ctx) as resp:
             body = resp.read()
         try:
-            checks = json.loads(body).get("checks")
-            if isinstance(checks, list):
-                self.checks = checks
+            reply = json.loads(body)
+            checks, watches = reply.get("checks"), reply.get("watch_paths")
         except (ValueError, AttributeError):
-            pass
+            return
+        if isinstance(checks, list):
+            self.checks = checks
+        if isinstance(watches, list) and self.dlp:
+            self.set_watches([w for w in watches if isinstance(w, dict) and "id" in w][:20])
+
+    def set_watches(self, watches):
+        """İzlenen klasör listesi değiştiyse izleyiciyi yeniden kurar."""
+        if watches == self.watch_defs:
+            return
+        if self.watcher:
+            self.watcher.close()
+        self.watch_defs = watches
+        self.watcher = FolderWatcher(watches) if watches else None
 
     def run_once(self, dry_run=False):
         report, conns = self.collect()
@@ -607,6 +841,10 @@ class Agent:
                 self.monitor.restore(conns)
             if "devices" in report:
                 self.last_scan = 0
+            if self.usb:
+                self.usb.restore(self._pending_dlp["usb"])
+            if self.watcher:
+                self.watcher.restore(self._pending_dlp["files"])
             print(f"rapor gönderilemedi: {exc}", file=sys.stderr, flush=True)
             return False
         self.pending_auth = {}

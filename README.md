@@ -20,6 +20,7 @@ Bağlantıyı her zaman Agent başlatır; şirket ağlarında dışarıya port a
 | Bağlantı analizi | Sunucuya gelen her TCP bağlantı denemesi (kapalı portlara gelenler dahil), başarılı/başarısız oturum açmalar (Linux: SSH, Windows: RDP ve ağ); kaynak, port, kullanıcı adı ve zaman dökümü |
 | Saldırı tespiti | Port taraması (10 dk içinde 15+ farklı port) ve parola denemesi saldırısı (10 dk içinde 10+ başarısız giriş) kritik uyarı üretir |
 | Servis sağlığı | Panelden tanımlanan TCP portu ve HTTP/HTTPS kontrolleri; yanıt süresi, 24 saatlik erişilebilirlik, sertifika bitiş süresi; art arda başarısız olan servis kritik uyarı üretir |
+| Veri koruma | USB depolama takılması ve hassas klasörlerdeki dosya işlemleri (okuma, yazma, silme, taşıma); toplu silme ve toplu okuma uyarıları |
 | Çok şirketli yönetim | Her şirketin kendi kodu ve ajan anahtarı vardır; panel tüm şirketleri birlikte veya tek tek gösterir |
 | Acil durum çağrısı | Kritik uyarılar Telegram botuna (ve isteğe bağlı webhook'a) gider; onaylanana kadar 15 dakikada bir tekrarlanır; şirket başına ayrı sohbet seçilebilir |
 
@@ -100,6 +101,33 @@ bağlantıları görür. Oturum açma denemeleri (RDP ve ağ; olay 4625/4624) he
 Kurmadan denemek için: `.\nobet-agent.ps1 -Manager https://... -Token nbt_... -Print`.
 Kaldırmak için: `.\uninstall.ps1`.
 
+## Veri koruma (veri sızıntısı izleme)
+
+**Veri Koruma** sayfası (yönetici ve operatör; izleyici göremez) iki şeyi izler:
+
+- **USB depolama:** ajan kurulu sunucuya USB bellek/disk takılınca ve çıkarılınca kayıt düşer (model, seri no,
+  kapasite) ve uyarı üretilir.
+- **Hassas klasörler:** panelden klasör yolu ve sunucu seçilir; o klasördeki (alt klasörler dahil) okuma, yazma,
+  oluşturma, silme ve taşıma işlemleri kaydedilir. 10 dakikada 50+ silme kritik, 500+ okuma uyarı üretir.
+
+Yalnızca dosya adı ve işlem türü kaydedilir; **dosya içeriği okunmaz ve hiçbir işlem engellenmez**. Bu bir izleme
+aracıdır, içerik denetimi yapan tam bir DLP değildir.
+
+| | Linux ajanı | Windows ajanı |
+| --- | --- | --- |
+| USB algılama | `/sys/block` | `Win32_DiskDrive` |
+| Klasör izleme | inotify | Security olayı 4663 (klasöre denetim kuralı eklenir) |
+| İşlemi yapan kullanıcı | **Bilinmez** | Bilinir (`ETKİALANI\kullanıcı`) |
+| Ön koşul | Yok | Kurulumda `-EnableFileAudit` |
+
+Windows'ta klasör izleme için ajanı `-EnableFileAudit` ile kurun; bu, "File System" denetim ilkesini açar ve
+ajanın izlenen klasörlere denetim kuralı (SACL) eklemesine izin verir. Bir sunucuda bu modülü tümüyle kapatmak
+için `agent.json` içine `"dlp": false` yazın. Sistem klasörleri ve sürücü kökleri izlemeye alınamaz.
+
+**Hukuki not:** Bu modül çalışanların dosya ve cihaz kullanımını kaydeder. İzlemeye başlamadan önce ilgili şirkette
+çalışanların bilgilendirilmesi ve hukuki dayanağın belirlenmesi gerekir (KVKK); bir hukukçuya danışın. Kayıtlar
+varsayılan olarak 30 gün sonra silinir (Ayarlar → Veri koruma).
+
 ## İşlem günlüğü
 
 **İşlem Günlüğü** sayfası (yalnızca yönetici) panelde yapılan her işlemi gösterir: kim, ne zaman, hangi IP'den,
@@ -155,6 +183,8 @@ python3 tools/demo.py http://127.0.0.1:8080 nbt_ANAHTAR
   ortamında PowerShell yoktu. Üretime almadan önce bir test sunucusunda `-Print` ile deneyin.
   Manager'ın Windows biçimli raporu işlediği otomatik testle doğrulandı.
 - Linux ajanı `/proc` ve ham soket kullanır; Windows ajanı CIM, komşu tablosu ve Security günlüğünü kullanır.
+- Veri koruma: Linux'ta dosya işlemini yapan kullanıcı bilinmez; USB algılama yalnızca ajan kurulu makineleri
+  kapsar (çalışan bilgisayarları için o bilgisayarlara da ajan kurmak gerekir); kopyalanan içerik izlenmez.
 - Servis kontrolleri TCP ve HTTP/HTTPS ile sınırlıdır (ping, DNS, içerik eşleştirme yok); kontroller ajanın
   rapor aralığında (varsayılan 30 sn) bir kez çalışır.
 - Bağlantı yakalama TCP içindir ve root gerektirir. Root yoksa ajan yalnızca kabul edilen

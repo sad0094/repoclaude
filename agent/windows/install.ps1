@@ -8,13 +8,19 @@ Packet Drop" audit subcategories so that EVERY inbound connection attempt (allow
 is visible to the agent. This writes many events to the Security log; without the switch the
 agent only sees connections that were actually established (capture mode "poll").
 
+-EnableFileAudit turns on the "File System" audit subcategory and lets the agent add an audit
+rule (SACL) to the sensitive folders that are defined in the Manager panel, so that file
+operations in those folders are reported together with the user name. Inform the employees
+of the company before enabling this (KVKK / data-protection law).
+
 ASCII-only on purpose (see nobet-agent.ps1).
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Manager,
     [Parameter(Mandatory = $true)][string]$Token,
-    [switch]$EnableConnectionAudit
+    [switch]$EnableConnectionAudit,
+    [switch]$EnableFileAudit
 )
 $ErrorActionPreference = 'Stop'
 
@@ -46,10 +52,16 @@ if ($EnableConnectionAudit) {
     $capture = 'audit'
 }
 
+if ($EnableFileAudit) {
+    & auditpol.exe /set '/subcategory:{0CCE921D-69AE-11D9-BED3-505054503030}' /success:enable | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'auditpol failed for File System.' }
+}
+
 if (Test-Path -LiteralPath $configFile) {
     Write-Host "$configFile already exists; left unchanged."
 } else {
-    @{ manager = $Manager; token = $Token; interval = 30; scan_interval = 300; capture = $capture } |
+    @{ manager = $Manager; token = $Token; interval = 30; scan_interval = 300; capture = $capture
+       file_audit = [bool]$EnableFileAudit } |
         ConvertTo-Json | Set-Content -LiteralPath $configFile -Encoding UTF8
 }
 

@@ -11,6 +11,10 @@ Collects and reports to the Nobet Manager:
       capture = "poll" : established connections only (no policy change needed)
   * Windows logon attempts (Security events 4625 failed, 4624 successful; network and RDP)
   * service health checks defined in the Manager (TCP port, HTTP/HTTPS URL, certificate expiry)
+  * data-leak monitoring: USB storage insert/remove, and file operations (with the user name) in
+    the sensitive folders defined in the Manager. Folder auditing uses Security event 4663 and
+    needs "file_audit": true in the config (install.ps1 -EnableFileAudit); the agent then adds an
+    audit rule (SACL) to each watched folder. Only file names and operation types are reported.
 
 Usage:
   nobet-agent.ps1                      # uses %ProgramData%\Nobet\agent.json
@@ -44,6 +48,11 @@ $script:PendingAuth = @{}    # "src|user|result|port" -> count
 $script:SeenConn = @{}       # poll mode: currently established tuples
 $script:PollReady = $false
 $script:Checks = @()         # check definitions received in the Manager's last reply
+$script:Watches = @()        # sensitive folders received in the Manager's last reply
+$script:WatchStatus = @{}    # watch id -> @{ id; ok; detail }
+$script:KnownUsb = $null     # serial/PNP id -> info of USB disks currently attached
+$script:PendingUsb = @()
+$script:PendingFiles = @{}   # "watchId|action|user|path" -> count
 $script:LastRecord = [long]-1
 $script:LastScan = [datetime]::MinValue
 $script:PrevNet = $null
@@ -299,6 +308,9 @@ function Read-SecurityLog($cfg, $LocalIps) {
         if ($type -eq '10') { $port = '3389' }
         Add-Count $script:PendingAuth ('{0}|{1}|{2}|{3}' -f $ip, $user, $result, $port)
     }
+    if ($cfg.dlp -ne $false) {
+        try { Read-FileAuditEvents $from $top } catch { Write-Log ('file audit read failed: ' + $_.Exception.Message) }
+    }
     $script:LastRecord = $top
 }
 
@@ -318,6 +330,87 @@ function Update-PolledConnections($LocalIps) {
     }
     $script:SeenConn = $current
     $script:PollReady = $true   # connections that existed at startup are not counted as new
+}
+
+# ------------------------------------------------------------------ data-leak monitoring
+function Update-UsbDevices {
+    # Compares attached USB disks with the previous cycle; disks present at startup are not events.
+    $current = @{}
+    foreach ($d in @(Get-CimInstance -ClassName Win32_DiskDrive -Filter "InterfaceType='USB'" -ErrorAction SilentlyContinue)) {
+        $serial = ([string]$d.SerialNumber).Trim()
+        $key = $serial
+        if (-not $key) { $key = [string]$d.PNPDeviceID }
+        $size = [long]0
+        if ($d.Size) { $size = [long]$d.Size }
+        $current[$key] = @{ vendor = ''; model = ([string]$d.Model).Trim(); serial = $serial; size = $size }
+    }
+    if ($null -ne $script:KnownUsb) {
+        foreach ($key in @($current.Keys)) {
+            if (-not $script:KnownUsb.ContainsKey($key)) { $e = $current[$key].Clone(); $e.action = 'insert'; $script:PendingUsb += $e }
+        }
+        foreach ($key in @($script:KnownUsb.Keys)) {
+            if (-not $current.ContainsKey($key)) { $e = $script:KnownUsb[$key].Clone(); $e.action = 'remove'; $script:PendingUsb += $e }
+        }
+    }
+    $script:KnownUsb = $current
+}
+
+function Set-WatchedFolders($cfg, $Definitions) {
+    # Applies the folder list from the Manager. Adding the audit rule changes the folder's SACL,
+    # so it only happens when the administrator opted in with "file_audit": true.
+    $script:Watches = @($Definitions | Select-Object -First 20)
+    $script:WatchStatus = @{}
+    foreach ($w in $script:Watches) {
+        $path = [string]$w.path
+        $status = @{ id = $w.id; ok = $false; detail = '' }
+        if ($cfg.file_audit -ne $true) { $status.detail = 'File auditing is off on this server (install with -EnableFileAudit)' }
+        elseif ($path -notmatch '^[A-Za-z]:\\.+' -or $path -like '*..*') { $status.detail = 'Invalid folder path' }
+        elseif (-not (Test-Path -LiteralPath $path -PathType Container)) { $status.detail = 'Folder not found' }
+        else {
+            try {
+                $acl = Get-Acl -LiteralPath $path -Audit
+                $everyone = New-Object System.Security.Principal.SecurityIdentifier 'S-1-1-0'
+                $rights = [System.Security.AccessControl.FileSystemRights]'ReadData, WriteData, AppendData, Delete, DeleteSubdirectoriesAndFiles'
+                $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+                $rule = New-Object System.Security.AccessControl.FileSystemAuditRule($everyone, $rights, $inherit,
+                    [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AuditFlags]::Success)
+                $acl.AddAuditRule($rule)      # additive: existing audit rules are kept
+                Set-Acl -LiteralPath $path -AclObject $acl
+                $status.ok = $true
+                $status.detail = 'Audit rule active'
+            } catch { $status.detail = 'Could not set audit rule: ' + $_.Exception.Message }
+        }
+        if ($status.detail.Length -gt 150) { $status.detail = $status.detail.Substring(0, 150) }
+        $script:WatchStatus[[string]$w.id] = $status
+    }
+}
+
+function Read-FileAuditEvents([long]$From, [long]$To) {
+    # 4663 = an object was accessed. AccessMask bits: 0x1 read, 0x2 write, 0x4 append, 0x10000 delete.
+    $active = @($script:Watches | Where-Object { $script:WatchStatus[[string]$_.id].ok })
+    if ($active.Count -eq 0) { return }
+    foreach ($ev in (Get-SecurityEvents 'EventID=4663' $From $To)) {
+        $f = Get-EventFields $ev
+        if ($f['ObjectType'] -ne 'File' -or $f['SubjectUserSid'] -eq 'S-1-5-18') { continue }   # skip SYSTEM
+        $user = [string]$f['SubjectUserName']
+        if (-not $user -or $user.EndsWith('$')) { continue }                                     # skip machine accounts
+        $object = [string]$f['ObjectName']
+        $watch = $null
+        foreach ($w in $active) {
+            $root = ([string]$w.path).TrimEnd('\')
+            if ($object.Length -ge $root.Length -and $object.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) -and
+                ($object.Length -eq $root.Length -or $object[$root.Length] -eq '\')) { $watch = $w; break }
+        }
+        if ($null -eq $watch) { continue }
+        $mask = 0
+        try { $mask = [Convert]::ToInt32((([string]$f['AccessMask']) -replace '^0x', ''), 16) } catch { continue }
+        if ($mask -band 0x10000) { $action = 'delete' }
+        elseif ($mask -band 0x6) { $action = 'write' }
+        elseif ($mask -band 0x1) { $action = 'read' }
+        else { continue }
+        if ($f['SubjectDomainName']) { $user = ([string]$f['SubjectDomainName']) + '\' + $user }
+        Add-Count $script:PendingFiles ('{0}|{1}|{2}|{3}' -f $watch.id, $action, $user, $object)
+    }
 }
 
 # ------------------------------------------------------------------ service health checks
@@ -434,6 +527,17 @@ function New-Report($cfg, $Local) {
         auth          = $auth
     }
     if (@($script:Checks).Count -gt 0 -and $cfg.checks -ne $false) { $report.checks = (Invoke-ServiceChecks) }
+    if ($cfg.dlp -ne $false) {
+        try { Update-UsbDevices } catch { Write-Log ('usb scan failed: ' + $_.Exception.Message) }
+        $files = @()
+        foreach ($key in @($script:PendingFiles.Keys | Select-Object -First 2000)) {
+            $p = $key.Split('|', 4)
+            $files += @{ watch_id = [int]$p[0]; action = $p[1]; user = $p[2]; path = $p[3]; count = [int]$script:PendingFiles[$key] }
+        }
+        if (@($script:PendingUsb).Count -gt 0 -or $files.Count -gt 0 -or @($script:Watches).Count -gt 0) {
+            $report.dlp = @{ usb = @($script:PendingUsb); files = $files; watch_status = @($script:WatchStatus.Values) }
+        }
+    }
     if ($cfg.discovery -and ((Get-Date) - $script:LastScan).TotalSeconds -ge [int]$cfg.scan_interval) {
         $report.devices = (Invoke-Discovery $Local.Nets)
         $script:LastScan = Get-Date
@@ -449,6 +553,14 @@ function Send-Report($cfg, $Report) {
         -UserAgent ('nobet-agent/' + $script:Version) -TimeoutSec 20 -UseBasicParsing
     # The reply carries the checks this server should run (an empty list clears them).
     if ($null -ne $reply -and ($reply.PSObject.Properties.Name -contains 'checks')) { $script:Checks = @($reply.checks) }
+    if ($null -ne $reply -and $cfg.dlp -ne $false -and ($reply.PSObject.Properties.Name -contains 'watch_paths')) {
+        $incoming = @($reply.watch_paths)
+        $signature = (@($incoming | ForEach-Object { '{0}={1}' -f $_.id, $_.path }) -join ';')
+        if ($signature -ne $script:WatchSignature) {      # re-apply only when the list changed
+            $script:WatchSignature = $signature
+            try { Set-WatchedFolders $cfg $incoming } catch { Write-Log ('watch setup failed: ' + $_.Exception.Message) }
+        }
+    }
 }
 
 function Invoke-Cycle($cfg, $Local) {
@@ -468,6 +580,8 @@ function Invoke-Cycle($cfg, $Local) {
     }
     $script:PendingConn = @{}
     $script:PendingAuth = @{}
+    $script:PendingUsb = @()
+    if ($report.ContainsKey('dlp')) { foreach ($f in @($report.dlp.files)) { $script:PendingFiles.Remove(('{0}|{1}|{2}|{3}' -f $f.watch_id, $f.action, $f.user, $f.path)) } }
     return $true
 }
 

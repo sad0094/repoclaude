@@ -344,6 +344,87 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual(self.status("/api/audit", {}), 404)
         self.assertEqual(self.status(f"/api/audit/{entries[0]['id']}/delete", {}), 404)
 
+    # ---------------------------------------------------------------- veri sızıntısı izleme
+    def test_usb_and_watched_folder_events(self):
+        first = self.call("/api/agent/report", report("fs-01"), token=self.xxxx["token"])
+        self.assertEqual(first["watch_paths"], [])
+        host_id = self.call("/api/hosts")["hosts"][0]["id"]
+        wid = self.call("/api/watchpaths", {"host_id": host_id, "path": "/srv/paylasim/muhasebe/", "label": "Muhasebe"})["id"]
+        sent = self.call("/api/agent/report", report("fs-01"), token=self.xxxx["token"])["watch_paths"]
+        self.assertEqual(sent, [{"id": wid, "path": "/srv/paylasim/muhasebe"}])
+
+        def send(**dlp):
+            self.call("/api/agent/report", report("fs-01", dlp=dlp), token=self.xxxx["token"])
+        send(usb=[{"action": "insert", "vendor": "Kingston", "model": "DataTraveler", "serial": "AB12", "size": 32 * 1024**3}],
+             watch_status=[{"id": wid, "ok": True, "detail": "3 klasör izleniyor"}],
+             files=[{"watch_id": wid, "action": "read", "path": "/srv/paylasim/muhasebe/bordro.xlsx", "user": "", "count": 4},
+                    {"watch_id": wid, "action": "write", "path": "/srv/paylasim/muhasebe/2026/fatura.pdf", "user": "", "count": 1},
+                    # Kabul edilmemesi gerekenler: klasör dışı yol, yukarı çıkma, bilinmeyen izleme, geçersiz işlem
+                    {"watch_id": wid, "action": "read", "path": "/etc/shadow", "count": 1},
+                    {"watch_id": wid, "action": "read", "path": "/srv/paylasim/muhasebe/../gizli", "count": 1},
+                    {"watch_id": 9999, "action": "read", "path": "/srv/paylasim/muhasebe/x", "count": 1},
+                    {"watch_id": wid, "action": "exec", "path": "/srv/paylasim/muhasebe/x", "count": 1}, "bozuk"])
+        alert = self.open_alerts()["usb:AB12"]
+        self.assertEqual((alert["severity"], alert["title"]), ("warn", "USB depolama takıldı: Kingston DataTraveler"))
+        self.assertIn("32.0 GB", alert["detail"])
+        data = self.call("/api/dlp?hours=1")
+        self.assertEqual(data["totals"], {"usb": 1, "files": 5, "deletes": 0, "reads": 4, "writes": 1})
+        self.assertEqual(data["usb"][0]["device"], "Kingston DataTraveler")
+        self.assertEqual({r["path"] for r in data["recent"]},
+                         {"/srv/paylasim/muhasebe/bordro.xlsx", "/srv/paylasim/muhasebe/2026/fatura.pdf"})
+        watch = data["watch_paths"][0]
+        self.assertEqual((watch["status"], watch["detail"], watch["events_24h"]), ("ok", "3 klasör izleniyor", 5))
+
+        # Toplu silme: eşik 50 -> kritik uyarı ve Telegram
+        send(files=[{"watch_id": wid, "action": "delete", "path": f"/srv/paylasim/muhasebe/d{i}.doc", "user": "ayse", "count": 1}
+                    for i in range(60)])
+        mass = self.open_alerts()["massdel:ayse"]
+        self.assertEqual(mass["severity"], "crit")
+        self.assertIn("60 silme", mass["detail"])
+        self.assertIn("Toplu dosya silme: ayse", self.messages()[-1]["text"])
+        self.assertEqual(self.call("/api/dlp?hours=1")["users"][0]["user"], "ayse")
+
+        self.call(f"/api/watchpaths/{wid}/delete", {})
+        self.assertEqual(self.call("/api/agent/report", report("fs-01"), token=self.xxxx["token"])["watch_paths"], [])
+        actions = [e["action"] for e in self.call("/api/audit?area=watch")["entries"]]
+        self.assertEqual(actions, ["watch.delete", "watch.create"])
+
+    def test_dlp_permissions_isolation_and_validation(self):
+        self.call("/api/agent/report", report("xxxx-fs"), token=self.xxxx["token"])
+        self.call("/api/agent/report", report("yyy-fs"), token=self.yyy["token"])
+        hosts = {h["hostname"]: h["id"] for h in self.call("/api/hosts")["hosts"]}
+        for path in ("/", "/srv", "/etc/ssl/private", "/proc/1", "srv/x", "C:\\", "C:\\Windows\\System32",
+                     "D:\\a\\..\\b", "/srv/a/../b", "x" * 300):
+            self.assertEqual(self.status("/api/watchpaths", {"host_id": hosts["xxxx-fs"], "path": path}), 400, path)
+        wid = self.call("/api/watchpaths", {"host_id": hosts["xxxx-fs"], "path": "D:\\Paylasim\\IK\\"})["id"]
+        self.assertEqual(self.status("/api/watchpaths", {"host_id": hosts["xxxx-fs"], "path": "D:\\Paylasim\\IK"}), 409)
+        # Windows yolu: büyük/küçük harf farkı kabul edilir; başka sunucunun ajanı bu izleme için kayıt gönderemez.
+        entry = {"watch_id": wid, "action": "read", "path": "d:\\paylasim\\ik\\ozluk.docx", "user": "SIRKET\\mehmet", "count": 2}
+        self.call("/api/agent/report", report("yyy-fs", dlp={"files": [entry]}), token=self.yyy["token"])
+        self.assertEqual(self.call("/api/dlp?hours=1")["totals"]["files"], 0)
+        self.call("/api/agent/report", report("xxxx-fs", dlp={"files": [entry]}), token=self.xxxx["token"])
+        self.assertEqual(self.call("/api/dlp?hours=1")["users"][0]["user"], "SIRKET\\mehmet")
+
+        self.make_user("yyy.operator", "operator", [self.yyy])
+        self.make_user("izleyici", "viewer", all_companies=True)
+        self.as_user("yyy.operator")
+        self.assertEqual(self.call("/api/dlp?hours=1")["totals"]["files"], 0)      # yalnızca kendi şirketi
+        self.assertEqual(self.call("/api/dlp?hours=1")["watch_paths"], [])
+        self.assertEqual(self.status("/api/watchpaths", {"host_id": hosts["xxxx-fs"], "path": "/srv/a/b"}), 404)
+        self.assertEqual(self.status(f"/api/watchpaths/{wid}/delete", {}), 404)
+        self.assertEqual(self.status("/api/watchpaths", {"host_id": hosts["yyy-fs"], "path": "/srv/a/b"}), 201)
+        self.as_user("izleyici")
+        self.assertEqual(self.status("/api/dlp"), 403)                               # çalışan etkinliği izleyiciye kapalı
+        self.assertEqual(self.status("/api/watchpaths", {"host_id": hosts["yyy-fs"], "path": "/srv/a/c"}), 403)
+
+    def test_dlp_events_expire_after_retention(self):
+        company = self.company(self.xxxx)
+        old = time.time() - 40 * 86400
+        self.engine.ingest(company, report("fs", dlp={"usb": [{"action": "insert", "model": "Eski"}]}), old)
+        self.engine.ingest(company, report("fs", dlp={"usb": [{"action": "insert", "model": "Yeni"}]}))
+        self.engine.tick()
+        self.assertEqual([r["device"] for r in self.db.q("SELECT device FROM dlp_events")], ["Yeni"])
+
     # ---------------------------------------------------------------- servis sağlık kontrolleri
     def add_check(self, host_id, **fields):
         body = {"host_id": host_id, "name": "ERP", "type": "http", "target": "https://erp.ic/saglik"}
@@ -676,6 +757,72 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("cert_days", unverified)
         self.assertTrue(trusted["ok"])
         self.assertTrue(19 <= trusted["cert_days"] <= 20, trusted)
+
+    def test_usb_monitor_detects_insert_and_remove(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            block = os.path.join(tmp, "sys", "block")
+            os.makedirs(os.path.join(block, "sda"))                      # USB olmayan disk
+            os.symlink(os.path.join(tmp, "devices", "pci0", "ata1", "host0"), os.path.join(block, "sda", "device"))
+            os.makedirs(os.path.join(tmp, "devices", "pci0", "ata1", "host0"))
+            mon = agent.UsbMonitor(block, interval=0)
+            self.assertEqual(mon.drain(), [])
+            usb = os.path.join(tmp, "devices", "pci0", "usb1", "1-2")
+            target = os.path.join(usb, "1-2:1.0", "host6", "target6:0:0", "6:0:0:0")
+            os.makedirs(target)
+            for name, value in (("vendor", "Kingston\n"), ("model", "DataTraveler 3.0\n")):
+                with open(os.path.join(target, name), "w") as f:
+                    f.write(value)
+            with open(os.path.join(usb, "serial"), "w") as f:
+                f.write("E0D55EA574\n")
+            os.makedirs(os.path.join(block, "sdb"))
+            os.symlink(target, os.path.join(block, "sdb", "device"))
+            with open(os.path.join(block, "sdb", "size"), "w") as f:
+                f.write("1000\n")
+            mon.poll()
+            mon.poll()                                                    # aynı aygıt ikinci kez bildirilmez
+            self.assertEqual(mon.drain(), [{"vendor": "Kingston", "model": "DataTraveler 3.0", "size": 512000,
+                                            "serial": "E0D55EA574", "action": "insert"}])
+            shutil.rmtree(os.path.join(block, "sdb"))
+            mon.poll()
+            self.assertEqual([(e["action"], e["serial"]) for e in mon.drain()], [("remove", "E0D55EA574")])
+
+    def test_folder_watcher_reports_file_operations(self):
+        def wait_for(watcher, expected, timeout=5):
+            seen, deadline = {}, time.time() + timeout
+            while time.time() < deadline and not expected <= set(seen):
+                time.sleep(0.05)
+                for (wid, action, path), n in watcher.drain().items():
+                    seen[(action, os.path.basename(path))] = seen.get((action, os.path.basename(path)), 0) + n
+            return seen
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "muhasebe")
+            os.makedirs(os.path.join(root, "2026"))
+            with open(os.path.join(root, "bordro.txt"), "w") as f:
+                f.write("x")
+            watcher = agent.FolderWatcher([{"id": 7, "path": root}, {"id": 8, "path": os.path.join(tmp, "yok")},
+                                           {"id": 9, "path": "/"}])
+            try:
+                status = {st["id"]: st for st in watcher.statuses()}
+                self.assertEqual((status[7]["ok"], status[7]["detail"]), (True, "2 klasör izleniyor"))
+                self.assertEqual((status[8]["ok"], status[8]["detail"]), (False, "Klasör bulunamadı"))
+                self.assertFalse(status[9]["ok"])
+                with open(os.path.join(root, "bordro.txt")) as f:
+                    f.read()
+                with open(os.path.join(root, "2026", "fatura.txt"), "w") as f:
+                    f.write("y")
+                os.rename(os.path.join(root, "2026", "fatura.txt"), os.path.join(root, "2026", "fatura-son.txt"))
+                os.remove(os.path.join(root, "bordro.txt"))
+                os.makedirs(os.path.join(root, "yeni"))
+                seen = wait_for(watcher, {("create", "yeni")})
+                with open(os.path.join(root, "yeni", "gizli.txt"), "w") as f:   # sonradan oluşan klasör de izlenir
+                    f.write("z")
+                seen.update(wait_for(watcher, {("write", "gizli.txt")}))
+            finally:
+                watcher.close()
+        for expected in (("read", "bordro.txt"), ("create", "fatura.txt"), ("write", "fatura.txt"),
+                         ("move", "fatura.txt"), ("move", "fatura-son.txt"), ("delete", "bordro.txt"),
+                         ("create", "yeni"), ("write", "gizli.txt")):
+            self.assertIn(expected, seen)
 
     def test_monitor_ignores_own_addresses(self):
         mon = agent.ConnectionMonitor.__new__(agent.ConnectionMonitor)

@@ -74,6 +74,24 @@ CREATE TABLE IF NOT EXISTS checks(
 );
 CREATE TABLE IF NOT EXISTS check_results(check_id INTEGER NOT NULL, ts REAL NOT NULL, ok INTEGER NOT NULL, latency_ms REAL);
 CREATE INDEX IF NOT EXISTS check_results_idx ON check_results(check_id, ts);
+CREATE TABLE IF NOT EXISTS watch_paths(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  host_id INTEGER NOT NULL,           -- klasörün bulunduğu sunucu
+  path TEXT NOT NULL, label TEXT DEFAULT '',
+  status TEXT DEFAULT 'unknown',      -- ok | error | unknown (ajanın bildirdiği)
+  detail TEXT DEFAULT '', checked_at REAL, created_at REAL
+);
+CREATE TABLE IF NOT EXISTS dlp_events(
+  id INTEGER PRIMARY KEY,
+  company_id INTEGER NOT NULL, host_id INTEGER NOT NULL, ts REAL NOT NULL,
+  kind TEXT NOT NULL,                 -- usb | file
+  action TEXT NOT NULL,               -- usb: insert/remove; file: read/write/create/delete/move
+  user TEXT DEFAULT '', path TEXT DEFAULT '', device TEXT DEFAULT '', detail TEXT DEFAULT '',
+  watch_id INTEGER, count INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS dlp_company_ts ON dlp_events(company_id, ts);
+CREATE INDEX IF NOT EXISTS dlp_host_ts ON dlp_events(host_id, ts);
 CREATE TABLE IF NOT EXISTS audit_log(
   id INTEGER PRIMARY KEY,
   ts REAL NOT NULL,
@@ -107,11 +125,13 @@ DEFAULTS = {
     "disk_warn": "80", "disk_crit": "90", "cpu_warn": "90", "mem_warn": "90",
     "offline_seconds": "120", "device_offline_seconds": "600",
     "scan_ports": "15", "brute_fails": "10", "check_fail_count": "2", "cert_warn_days": "14",
+    "usb_alert": "1", "dlp_delete_threshold": "50", "dlp_read_threshold": "500", "dlp_retention_days": "30",
     "reminder_minutes": "15", "notify_warn": "0",
     "telegram_bot_token": "", "telegram_chat_id": "", "webhook_url": "", "panel_url": "",
 }
 NUMERIC = {"disk_warn", "disk_crit", "cpu_warn", "mem_warn", "offline_seconds",
-           "device_offline_seconds", "scan_ports", "brute_fails", "check_fail_count", "cert_warn_days", "reminder_minutes", "notify_warn"}
+           "device_offline_seconds", "scan_ports", "brute_fails", "check_fail_count", "cert_warn_days",
+           "usb_alert", "dlp_delete_threshold", "dlp_read_threshold", "dlp_retention_days", "reminder_minutes", "notify_warn"}
 
 
 def sha256(text):
